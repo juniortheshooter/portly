@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Portly
+GenericName=Local App Studio
+Comment=Manage, start, stop, and view live logs for local web apps
+Exec=sh -c 'cd "$(dirname "%k")" && ./start-portly.sh'
+Terminal=false
+Categories=Development;WebDevelopment;Utility;
+StartupWMClass=Portly

@@ -1,0 +1,23 @@
+#!/bin/bash
+set -e
+BUNDLE_EXEC="$(cd "$(dirname "$0")" && pwd)"
+MAC_ROOT="$(cd "$BUNDLE_EXEC/../../.." && pwd)"
+FALLBACK_DIR="$MAC_ROOT"
+if [ -f "$MAC_ROOT/desktop-app.js" ]; then
+  APP_DIR="$MAC_ROOT"
+else
+  APP_DIR="$FALLBACK_DIR"
+fi
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin:$PATH"
+if [ -d "$HOME/.nvm/versions/node" ]; then
+  LATEST_NODE="$(ls -1 "$HOME/.nvm/versions/node" | sort -V | tail -n 1)"
+  if [ -n "$LATEST_NODE" ]; then
+    export PATH="$HOME/.nvm/versions/node/$LATEST_NODE/bin:$PATH"
+  fi
+fi
+if ! command -v node >/dev/null 2>&1; then
+  osascript -e 'display alert "Node.js Required" message "Install Node.js to launch Portly." as critical'
+  exit 1
+fi
+cd "$APP_DIR"
+exec node "$APP_DIR/desktop-app.js"

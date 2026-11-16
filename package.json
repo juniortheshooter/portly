@@ -1,0 +1,116 @@
+{
+  "name": "portly",
+  "productName": "Portly",
+  "version": "1.2.0",
+  "description": "Portly — Multi-OS (Windows, macOS, Linux) downloadable open-source desktop application to start, stop, monitor, and log local web apps and dev servers",
+  "author": "Gabe — DNG Web Solutions",
+  "license": "MIT",
+  "homepage": "https://github.com/juniortheshooter/portly",
+  "keywords": [
+    "portly",
+    "local-dev",
+    "dev-server",
+    "process-manager",
+    "open-source",
+    "freeware",
+    "electron",
+    "nodejs"
+  ],
+  "main": "electron-main.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "app": "node desktop-app.js",
+    "install-app": "node install-app.js",
+    "electron": "electron electron-main.js",
+    "test": "node test-multi-os.js",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
+    "release": "node build-release.js",
+    "mcp": "node portly-mcp.js",
+    "cli": "node portly-cli.js"
+  },
+  "devDependencies": {
+    "electron": "^45.3.2",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.portly.localstudio",
+    "productName": "Portly",
+    "afterPack": "./embed-win-icon.js",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron-main.js",
+      "server.js",
+      "static-server.js",
+      "portly-cli.js",
+      "portly-mcp.js",
+      "portly-client.js",
+      "desktop-app.js",
+      "install-app.js",
+      "public/**/*",
+      "LICENSE",
+      "README.md",
+      "package.json",
+      "!public/*.jpg"
+    ],
+    "win": {
+      "icon": "public/portly-logo.ico",
+      "signAndEditExecutable": true,
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "mac": {
+      "icon": "public/portly-logo.png",
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}"
+    },
+    "linux": {
+      "icon": "public/portly-logo.png",
+      "category": "Development",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
+      "maintainer": "DnG Web Solutions <info@dngwebsolutions.com>"
+    },
+    "publish": null,
+    "nsis": {
+      "artifactName": "${productName}-Setup-${version}-win-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "${productName}-Portable-${version}-win-${arch}.${ext}"
+    },
+    "asarUnpack": [
+      "static-server.js",
+      "portly-client.js",
+      "portly-mcp.js",
+      "portly-cli.js",
+      "package.json"
+    ]
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juniortheshooter/portly.git"
+  },
+  "bugs": {
+    "url": "https://github.com/juniortheshooter/portly/issues"
+  },
+  "bin": {
+    "portly-mcp": "portly-mcp.js",
+    "portly-cli": "portly-cli.js"
+  }
+}

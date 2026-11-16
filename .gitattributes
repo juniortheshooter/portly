@@ -1,0 +1,10 @@
+* text=auto
+*.sh text eol=lf
+*.command text eol=lf
+Portly.app/Contents/MacOS/Portly text eol=lf
+Portly.desktop text eol=lf
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.png binary
+*.ico binary
+*.jpg binary

@@ -1,0 +1,20 @@
+node_modules/
+dist/
+release/
+logs/*.log
+crash-reports/*.log
+configs/*.json
+data/projects.json
+data/settings.json
+data/layout.json
+data/desktop-profile/
+*.portly.json
+.DS_Store
+Thumbs.db
+crash-reports/
+configs/
+data/
+# Windows shortcut holds an absolute path; regenerate it with `npm run install-app`
+Portly.lnk
+# Unused large source images (the app uses the .png/.ico versions)
+public/*.jpg
