@@ -657,7 +657,11 @@ async function run() {
   // 8. Windows PATH / Path casing merge + System32 preservation when localbins exist
   check('buildCrossPlatformEnv() preserves Windows System32 and merges Path/PATH case-insensitively', () => {
     assert.strictEqual(typeof srv.buildCrossPlatformEnv, 'function', 'buildCrossPlatformEnv must be exported');
-    const env = srv.buildCrossPlatformEnv(4999, ROOT_DIR);
+    // Use a throwaway project folder that has node_modules/.bin, so the check does not
+    // depend on whether `npm install` has run in the Portly folder itself (CI skips it).
+    const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'portly-env-'));
+    fs.mkdirSync(path.join(fixtureDir, 'node_modules', '.bin'), { recursive: true });
+    const env = srv.buildCrossPlatformEnv(4999, fixtureDir);
     assert.strictEqual(env.PORT, '4999');
     if (process.platform === 'win32') {
       const pathKeys = Object.keys(env).filter((k) => k.toLowerCase() === 'path');
@@ -668,7 +672,7 @@ async function run() {
         normalized.some((p) => p.includes('\\system32')),
         `Expected Windows System32 in merged Path/PATH, got: ${pathEntries.slice(0, 8).join(';')}`
       );
-      const localBin = path.join(ROOT_DIR, 'node_modules', '.bin').toLowerCase();
+      const localBin = path.join(fixtureDir, 'node_modules', '.bin').toLowerCase();
       assert.ok(normalized.includes(localBin), `Expected local node_modules/.bin in PATH: ${localBin}`);
     }
   });

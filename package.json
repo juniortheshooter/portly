@@ -1,7 +1,7 @@
 {
   "name": "portly",
   "productName": "Portly",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Portly — Multi-OS (Windows, macOS, Linux) downloadable open-source desktop application to start, stop, monitor, and log local web apps and dev servers",
   "author": "Gabe — DNG Web Solutions",
   "license": "MIT",

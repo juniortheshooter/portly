@@ -1,8 +1,30 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/portly-logo-dark.png">
+    <img src="docs/assets/portly-logo-light.png" width="140" height="140" alt="Portly logo">
+  </picture>
+</p>
+
 # Portly — Local App Studio
 
 Portly is a free, open-source desktop app for Windows, macOS, and Linux that starts, stops, monitors, and logs the local web apps and dev servers you work on, all from one window.
 
 Made by **DNG Web Solutions** and released as freeware under the [MIT License](LICENSE).
+
+## Get Portly running
+
+You do not need to know how to code to install Portly. It takes about five minutes.
+
+1. **Download the file.** Open the [latest release](https://github.com/juniortheshooter/portly/releases/latest) and scroll to **Assets**. On Windows, choose the file that starts with `Portly-Setup`. On a Mac, choose the `.dmg` file.
+2. **Install Portly.**
+   - **Windows:** double-click the `Portly-Setup` file. If a blue box says "Windows protected your PC", select **More info** and then **Run anyway**.
+   - **Mac:** open the `.dmg` file and drag Portly into the Applications folder.
+   - **Linux:** right-click the `.AppImage` file, allow it to run as a program in its properties, and double-click it.
+3. **Open the app.** On Windows, open the Start menu and type Portly. On a Mac, right-click Portly in Applications and choose **Open** the first time.
+4. **Add your project.** Select **Add Project**, then **Browse**, and choose the folder that holds your website or app. Portly reads the folder and enters the start command for you. Select **Add Project** again to save it.
+5. **Press Start.** **Start** runs the project, and **Start & Open** also opens it in your browser. Press **Stop** when you are done.
+
+Portly runs each project with the tools that are already on your computer. A Node.js project needs [Node.js](https://nodejs.org), and a Python project needs Python.
 
 ---
 
@@ -196,7 +218,7 @@ After forking or renaming the repository, run `node scripts/set-repo.js your-git
 
 ### Automated releases
 
-Pushing a tag such as `v1.2.0` runs the GitHub Actions workflow in `.github/workflows/release.yml`. It runs the tests, builds Windows, macOS, and Linux packages on their own systems, and attaches them with a `SHA256SUMS.txt` file to a draft GitHub Release for you to review and publish.
+Pushing a tag such as `v1.2.0` runs the GitHub Actions workflow in `.github/workflows/release.yml`. It runs the tests, builds Windows, macOS, and Linux packages on their own systems, and publishes them with a `SHA256SUMS.txt` file as a GitHub Release. Bump `version` in `package.json` before tagging, so the file names match the tag.
 
 ---
 
