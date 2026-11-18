@@ -8,6 +8,9 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn, execFileSync } = require('node:child_process');
 const { URL } = require('node:url');
+const envStoreLib = require('./env-store');
+const namedUrls = require('./named-urls');
+const stackDetect = require('./stack-detect');
 
 const PORT = Number(process.env.PORT) || 4567;
 const HOST = '127.0.0.1';
@@ -24,6 +27,12 @@ const CONFIGS_DIR = path.join(STORAGE_ROOT, 'configs');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const LAYOUT_FILE = path.join(DATA_DIR, 'layout.json');
+const STACKS_FILE = path.join(DATA_DIR, 'stacks.json');
+const ENV_VARS_FILE = path.join(DATA_DIR, 'env-vars.json');
+// How long a stack waits for a service to answer on its port before starting the next one.
+const STACK_READY_TIMEOUT_MS = Number(process.env.PORTLY_STACK_READY_TIMEOUT_MS) || 60000;
+// A worker counts as started once it has stayed up this long.
+const WORKER_READY_MS = 1500;
 // In packaged builds the app lives inside app.asar, which plain `node` cannot read, so the
 // static server is shipped unpacked next to it (see build.asarUnpack in package.json).
 const STATIC_SERVER_SCRIPT = path
@@ -32,6 +41,12 @@ const STATIC_SERVER_SCRIPT = path
 
 const MAX_MEMORY_LOGS = 500;
 const MAX_READ_LOG_LINES = 200;
+// Rotate a project's log file once it passes this size, keeping one older file (<id>.1.log).
+const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
+// Batch log lines sent to the UI so a chatty build doesn't trigger one event per line.
+const LOG_BROADCAST_INTERVAL_MS = 75;
+const SAFE_ID_REGEX = /^[A-Za-z0-9_-]{1,80}$/;
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 const ANSI_REGEX = /(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\)|\x1B[@-Z\\-_])/g;
@@ -53,6 +68,8 @@ const MIME_TYPES = {
 
 /** @type {Array<object>} */
 let projects = [];
+/** Stacks: groups of services (projects with a matching stackId). Saved in data/stacks.json. */
+let stacks = [];
 
 /** @type {(() => Promise<{ path: string | null }>) | null} */
 let customFolderPicker = null;
@@ -111,6 +128,81 @@ const runtimeState = new Map();
 
 /** @type {Set<http.ServerResponse>} */
 const sseClients = new Set();
+
+/** Problems found while loading saved data, shown once in the UI (GET /api/notices). */
+const startupNotices = [];
+
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    // Atomics.wait unavailable: retry immediately
+  }
+}
+
+/**
+ * Writes a file so that a crash, power cut or forced quit can never leave it half-written:
+ * the content goes to a temp file first, is flushed to disk, then renamed over the original
+ * (an atomic replace on Windows, macOS and Linux).
+ */
+function writeFileAtomic(filePath, content) {
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  const fd = fs.openSync(tmpPath, 'w');
+  try {
+    fs.writeSync(fd, content, null, 'utf8');
+    try {
+      fs.fsyncSync(fd);
+    } catch {
+      // fsync is best effort (not supported on some network drives)
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(tmpPath, filePath);
+      return;
+    } catch (err) {
+      // Antivirus, indexers and sync tools on Windows can briefly lock the target file.
+      if (['EPERM', 'EBUSY', 'EACCES'].includes(err.code) && attempt < 6) {
+        sleepSync(25 * (attempt + 1));
+        continue;
+      }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // ignore
+      }
+      throw err;
+    }
+  }
+}
+
+function writeJsonAtomic(filePath, data) {
+  writeFileAtomic(filePath, JSON.stringify(data, null, 2));
+}
+
+function timestampForFileName() {
+  return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+/** Moves an unreadable data file aside so it is never overwritten, and returns the new path. */
+function quarantineCorruptFile(filePath) {
+  const parsed = path.parse(filePath);
+  const target = path.join(parsed.dir, `${parsed.name}.corrupt-${timestampForFileName()}${parsed.ext}`);
+  try {
+    fs.renameSync(filePath, target);
+    return target;
+  } catch {
+    try {
+      fs.copyFileSync(filePath, target);
+      return target;
+    } catch {
+      return null;
+    }
+  }
+}
 
 function ensureDirectories() {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -222,8 +314,12 @@ function loadLayout() {
 function saveLayout(nextLayout) {
   ensureDirectories();
   savedLayout = sanitizeLayout(nextLayout);
-  fs.writeFileSync(LAYOUT_FILE, JSON.stringify(savedLayout, null, 2), 'utf8');
+  writeJsonAtomic(LAYOUT_FILE, savedLayout);
   return savedLayout;
+}
+
+function normalizeTheme(value) {
+  return value === 'dark' || value === 'system' ? value : 'light';
 }
 
 function getDefaultSettings() {
@@ -233,8 +329,30 @@ function getDefaultSettings() {
     defaultExpanded: false,
     allowMultipleInstances: false,
     exitClosesCompletely: false,
-    onboarded: false
+    onboarded: false,
+    namedUrls: true,
+    proxyPort: namedUrls.DEFAULT_PROXY_PORT
   };
+}
+
+function validateProxyPortInput(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    const err = new Error('The named URL port must be a number between 1 and 65535.');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (n === PORT) {
+    const err = new Error(`Port ${n} is Portly's own port. Pick another one.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return n;
+}
+
+function normalizeProxyPort(value, fallback = namedUrls.DEFAULT_PROXY_PORT) {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
 }
 
 function loadSettings() {
@@ -247,11 +365,13 @@ function loadSettings() {
       const cleanName = typeof parsed.userName === 'string' ? parsed.userName.trim() : '';
       settings = {
         userName: cleanName,
-        theme: parsed.theme === 'dark' ? 'dark' : 'light',
+        theme: normalizeTheme(parsed.theme),
         defaultExpanded: Boolean(parsed.defaultExpanded),
         allowMultipleInstances: Boolean(parsed.allowMultipleInstances),
         exitClosesCompletely: Boolean(parsed.exitClosesCompletely),
-        onboarded: Boolean(parsed.onboarded) && Boolean(cleanName)
+        onboarded: Boolean(parsed.onboarded) && Boolean(cleanName),
+        namedUrls: parsed.namedUrls === undefined ? true : Boolean(parsed.namedUrls),
+        proxyPort: normalizeProxyPort(parsed.proxyPort)
       };
       return;
     } catch {
@@ -268,7 +388,7 @@ function saveSettings(nextSettings) {
   const cleanName = typeof nextSettings.userName === 'string' ? nextSettings.userName.trim() : '';
   settings = {
     userName: cleanName,
-    theme: nextSettings.theme === 'dark' ? 'dark' : 'light',
+    theme: normalizeTheme(nextSettings.theme),
     defaultExpanded: Boolean(nextSettings.defaultExpanded),
     allowMultipleInstances:
       nextSettings.allowMultipleInstances !== undefined
@@ -281,9 +401,26 @@ function saveSettings(nextSettings) {
     onboarded:
       nextSettings.onboarded !== undefined
         ? Boolean(nextSettings.onboarded) && Boolean(cleanName)
-        : Boolean(cleanName)
+        : Boolean(cleanName),
+    namedUrls:
+      nextSettings.namedUrls !== undefined
+        ? Boolean(nextSettings.namedUrls)
+        : settings && settings.namedUrls !== undefined
+          ? Boolean(settings.namedUrls)
+          : true,
+    proxyPort: normalizeProxyPort(
+      nextSettings.proxyPort,
+      settings && settings.proxyPort ? settings.proxyPort : namedUrls.DEFAULT_PROXY_PORT
+    )
   };
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+  writeJsonAtomic(SETTINGS_FILE, settings);
+  for (const listener of settingsListeners) {
+    try {
+      listener(settings);
+    } catch (err) {
+      console.error('Settings listener failed:', err.message);
+    }
+  }
   return settings;
 }
 
@@ -292,8 +429,8 @@ function resetSettings() {
   settings = { ...defaults };
   savedLayout = getDefaultLayout();
   ensureDirectories();
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
-  fs.writeFileSync(LAYOUT_FILE, JSON.stringify(savedLayout, null, 2), 'utf8');
+  writeJsonAtomic(SETTINGS_FILE, settings);
+  writeJsonAtomic(LAYOUT_FILE, savedLayout);
   broadcastEvent('settings-updated', settings);
   return settings;
 }
@@ -1495,8 +1632,35 @@ function createInitialRuntimeState() {
     stopping: false,
     process: null,
     probeTimer: null,
-    logs: []
+    logs: [],
+    // Set while a start is in progress (port search + spawn) so a second Start waits for it
+    // instead of spawning a second, untracked server.
+    startPromise: null,
+    // Set while a stop is in progress; resolves when the child has really exited.
+    stopPromise: null,
+    // Resolves when the current child process exits (or fails to spawn).
+    exitPromise: null,
+    // Last few stderr/stdout lines, used to explain a crash on the card.
+    lastErrorLine: null,
+    crashReason: null,
+    // Port we warned is in use by another program (custom ports only).
+    portConflict: false,
+    hasLog: undefined
   };
+}
+
+/** Clears everything about a run, leaving the project in `status`. */
+function resetRuntimeState(state, status) {
+  clearProbeTimer(state);
+  state.status = status;
+  state.pid = null;
+  state.startedAt = null;
+  state.detectedUrl = null;
+  state.assignedPort = null;
+  state.process = null;
+  state.exitPromise = null;
+  state.stopping = false;
+  state.portConflict = false;
 }
 
 function getRuntimeState(id) {
@@ -1508,13 +1672,33 @@ function getRuntimeState(id) {
   return state;
 }
 
+function getLogFileBaseName(id) {
+  const raw = String(id || '');
+  // Project ids normally are UUIDs. Anything else (for example an id from an old or
+  // hand-edited config) is hashed so it can never point outside the logs folder.
+  return SAFE_ID_REGEX.test(raw)
+    ? raw
+    : `id-${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24)}`;
+}
+
 function getLogFilePath(id) {
-  return path.join(LOGS_DIR, `${id}.log`);
+  const target = path.join(LOGS_DIR, `${getLogFileBaseName(id)}.log`);
+  const rel = path.relative(LOGS_DIR, target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    const err = new Error('Invalid project id.');
+    err.statusCode = 400;
+    throw err;
+  }
+  return target;
+}
+
+function getRotatedLogFilePath(id) {
+  return path.join(LOGS_DIR, `${getLogFileBaseName(id)}.1.log`);
 }
 
 function saveProjects() {
   ensureDirectories();
-  fs.writeFileSync(PROJECTS_FILE, JSON.stringify(projects, null, 2), 'utf8');
+  writeJsonAtomic(PROJECTS_FILE, projects);
 }
 
 const PROJECT_MARKER_FILES = [
@@ -1623,7 +1807,30 @@ function lenientPort(raw) {
   }
 }
 
-function createProjectRecord({ path: rawPath, name, command, customPort }) {
+/**
+ * Finds a project that would clash with a new one at this path. Stand-alone projects are
+ * unique per folder. Services of a stack may share a folder (a Procfile's web and worker),
+ * but not the same folder and command twice in one stack.
+ */
+function findDuplicateProject(resolvedPath, { stackId = null, command = null, excludeId = null } = {}) {
+  const key = normalizePathKey(resolvedPath);
+  return projects.find((p) => {
+    if (p.id === excludeId || normalizePathKey(p.path) !== key) return false;
+    if (!stackId) return !p.stackId;
+    return p.stackId === stackId && command !== null && p.command === command;
+  });
+}
+
+function createProjectRecord({
+  path: rawPath,
+  name,
+  command,
+  customPort,
+  stackId,
+  kind,
+  hostname,
+  _deferSave
+}) {
   const inspection = inspectProjectPath(rawPath);
   if (!inspection.valid) {
     const err = new Error(inspection.error);
@@ -1631,11 +1838,26 @@ function createProjectRecord({ path: rawPath, name, command, customPort }) {
     throw err;
   }
 
-  const normalizedKey = normalizePathKey(inspection.resolvedPath);
-  const duplicate = projects.find((p) => normalizePathKey(p.path) === normalizedKey);
+  const finalCommand =
+    command && String(command).trim()
+      ? String(command).trim()
+      : inspection.recommendedCommand || inspection.suggestedCommand;
+  const duplicate = findDuplicateProject(inspection.resolvedPath, {
+    stackId: stackId || null,
+    command: finalCommand
+  });
   if (duplicate) {
-    const err = new Error(`Project already registered: ${duplicate.name} (${duplicate.path})`);
+    const err = new Error(
+      stackId
+        ? `This stack already runs "${finalCommand}" in ${duplicate.path} (${duplicate.name}).`
+        : `Project already registered: ${duplicate.name} (${duplicate.path})`
+    );
     err.statusCode = 409;
+    throw err;
+  }
+  if (stackId && !stacks.some((s) => s.id === stackId)) {
+    const err = new Error('Stack not found.');
+    err.statusCode = 404;
     throw err;
   }
 
@@ -1645,37 +1867,84 @@ function createProjectRecord({ path: rawPath, name, command, customPort }) {
     id: crypto.randomUUID(),
     name: name && String(name).trim() ? String(name).trim() : inspection.name,
     path: inspection.resolvedPath,
-    command:
-      command && String(command).trim()
-        ? String(command).trim()
-        : inspection.recommendedCommand || inspection.suggestedCommand,
+    command: finalCommand,
     customPort: portStr,
     createdAt: new Date().toISOString(),
     lastStartedAt: null
   };
+  if (stackId) {
+    record.stackId = stackId;
+    record.startAfter = [];
+  }
+  if (kind !== undefined) record.kind = cleanServiceKind(kind);
+  record.hostname =
+    hostname && String(hostname).trim()
+      ? claimHostname(hostname, { projectId: record.id })
+      : defaultHostnameFor(record);
 
   applyInspectionToProject(record, inspection, false);
 
   projects.push(record);
   getRuntimeState(record.id);
-  saveProjects();
+  if (!_deferSave) saveProjects();
   return record;
+}
+
+function readProjectsFile(filePath) {
+  const raw = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '');
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error('projects.json does not contain a list of projects.');
+  }
+  return parsed.filter((p) => p && typeof p === 'object' && typeof p.path === 'string');
 }
 
 function loadOrSeedProjects() {
   ensureDirectories();
+  const backupFile = `${PROJECTS_FILE}.bak`;
+
   if (fs.existsSync(PROJECTS_FILE)) {
+    let loaded = null;
     try {
-      const raw = fs.readFileSync(PROJECTS_FILE, 'utf8').replace(/^\uFEFF/, '');
-      const parsed = JSON.parse(raw);
-      projects = Array.isArray(parsed) ? parsed : [];
+      loaded = readProjectsFile(PROJECTS_FILE);
+      // This file parsed fine, so keep it as the last known good copy.
+      try {
+        fs.copyFileSync(PROJECTS_FILE, backupFile);
+      } catch {
+        // backup is best effort
+      }
     } catch (err) {
-      console.error('Failed to read projects.json, starting empty:', err.message);
-      projects = [];
+      console.error('Failed to read projects.json:', err.message);
+      const movedTo = quarantineCorruptFile(PROJECTS_FILE);
+      let restored = null;
+      if (fs.existsSync(backupFile)) {
+        try {
+          restored = readProjectsFile(backupFile);
+        } catch {
+          restored = null;
+        }
+      }
+      if (restored) {
+        loaded = restored;
+        startupNotices.push({
+          level: 'warning',
+          message: `Your project list was damaged, so Portly restored it from the last backup (${restored.length} project${restored.length === 1 ? '' : 's'}).${movedTo ? ` The damaged file was kept at ${movedTo}.` : ''}`
+        });
+      } else {
+        loaded = [];
+        startupNotices.push({
+          level: 'error',
+          message: `Portly couldn't read your project list and found no backup, so it started empty.${movedTo ? ` The damaged file was kept at ${movedTo}.` : ''}`
+        });
+      }
     }
 
-    let migrated = false;
+    projects = loaded;
+    const before = JSON.stringify(projects);
     for (const p of projects) {
+      if (!p.id || typeof p.id !== 'string') {
+        p.id = crypto.randomUUID();
+      }
       getRuntimeState(p.id);
       const inspection = inspectProjectPath(p.path);
       if (inspection.valid) {
@@ -1685,10 +1954,10 @@ function loadOrSeedProjects() {
           inspection.recommendedCommand !== 'npm run dev' &&
           inspection.framework.includes('Vite');
         applyInspectionToProject(p, inspection, shouldAutoFixCommand);
-        migrated = true;
       }
     }
-    if (migrated) {
+    // Only rewrite the file when something actually changed.
+    if (JSON.stringify(projects) !== before) {
       saveProjects();
     }
     return;
@@ -1697,22 +1966,36 @@ function loadOrSeedProjects() {
   // Fresh installs always start with an empty workspace. Nothing is auto-imported
   // from the app folder or its neighbours, so no personal paths leak into new installs.
   projects = [];
+  if (fs.existsSync(backupFile)) {
+    try {
+      const restored = readProjectsFile(backupFile);
+      if (restored.length > 0) {
+        projects = restored;
+        for (const p of projects) getRuntimeState(p.id);
+        startupNotices.push({
+          level: 'warning',
+          message: `Your project list was missing, so Portly restored it from the last backup (${restored.length} project${restored.length === 1 ? '' : 's'}).`
+        });
+      }
+    } catch {
+      // ignore unreadable backup
+    }
+  }
   saveProjects();
 }
 
 function serializeProject(project) {
   const state = getRuntimeState(project.id);
-  const logPath = getLogFilePath(project.id);
   let logCount = state.logs.length;
-  if (logCount === 0 && fs.existsSync(logPath)) {
-    try {
-      const stat = fs.statSync(logPath);
-      if (stat.size > 0) {
-        logCount = 1;
+  if (logCount === 0) {
+    if (state.hasLog === undefined) {
+      try {
+        state.hasLog = fs.statSync(getLogFilePath(project.id)).size > 0;
+      } catch {
+        state.hasLog = false;
       }
-    } catch {
-      // Ignore stat error
     }
+    if (state.hasLog) logCount = 1;
   }
 
   return {
@@ -1723,7 +2006,13 @@ function serializeProject(project) {
     exitCode: state.exitCode,
     detectedUrl: state.detectedUrl,
     assignedPort: state.assignedPort,
-    logCount
+    crashReason: state.status === 'crashed' ? state.crashReason : null,
+    portConflict: Boolean(state.portConflict),
+    logCount,
+    kind: project.kind || 'server',
+    startAfter: Array.isArray(project.startAfter) ? project.startAfter : [],
+    namedUrl: getNamedUrlFor(project.hostname, project),
+    env: envStore.summary(project.id)
   };
 }
 
@@ -1738,12 +2027,133 @@ function broadcastEvent(eventName, payload) {
   }
 }
 
-function broadcastProjectStatus(project) {
-  broadcastEvent('project-status', serializeProject(project));
+/** In-process listeners (the Electron shell uses this for the tray and crash notifications). */
+const projectStatusListeners = new Set();
+const settingsListeners = new Set();
+
+function onProjectStatus(listener) {
+  if (typeof listener === 'function') projectStatusListeners.add(listener);
+  return () => projectStatusListeners.delete(listener);
 }
 
-function appendLog(projectId, stream, rawText) {
-  const cleanText = stripAnsi(rawText);
+function onSettingsChanged(listener) {
+  if (typeof listener === 'function') settingsListeners.add(listener);
+  return () => settingsListeners.delete(listener);
+}
+
+function listProjectsWithStatus() {
+  return projects.map(serializeProject);
+}
+
+function broadcastProjectStatus(project) {
+  const payload = serializeProject(project);
+  broadcastEvent('project-status', payload);
+  if (project.stackId) broadcastStackStatus(project.stackId);
+  for (const listener of projectStatusListeners) {
+    try {
+      listener(payload);
+    } catch (err) {
+      console.error('Project status listener failed:', err.message);
+    }
+  }
+}
+
+/** @type {Map<string, { stream: fs.WriteStream, bytes: number }>} */
+const logWriters = new Map();
+/** @type {Map<string, Array<object>>} */
+const pendingLogBroadcasts = new Map();
+let logBroadcastTimer = null;
+
+function closeLogWriter(projectId) {
+  const writer = logWriters.get(projectId);
+  if (!writer) return Promise.resolve();
+  logWriters.delete(projectId);
+  return new Promise((resolve) => {
+    writer.stream.end(() => resolve());
+    writer.stream.once('error', () => resolve());
+  });
+}
+
+function rotateLogFileIfNeeded(projectId, logPath, writer) {
+  if (writer.bytes < MAX_LOG_FILE_BYTES) return writer;
+  logWriters.delete(projectId);
+  writer.stream.end();
+  try {
+    const rotated = getRotatedLogFilePath(projectId);
+    fs.rmSync(rotated, { force: true });
+    fs.renameSync(logPath, rotated);
+  } catch (err) {
+    // If the rename fails (file locked on Windows), keep appending to the same file.
+    console.error(`Failed to rotate log for ${projectId}:`, err.message);
+  }
+  return getLogWriter(projectId);
+}
+
+function getLogWriter(projectId) {
+  const existing = logWriters.get(projectId);
+  if (existing) return existing;
+  const logPath = getLogFilePath(projectId);
+  let bytes = 0;
+  try {
+    bytes = fs.statSync(logPath).size;
+  } catch {
+    bytes = 0;
+  }
+  const stream = fs.createWriteStream(logPath, { flags: 'a' });
+  const writer = { stream, bytes, logPath };
+  stream.on('error', (err) => {
+    console.error(`Failed to write log for ${projectId}:`, err.message);
+    if (logWriters.get(projectId) === writer) logWriters.delete(projectId);
+  });
+  logWriters.set(projectId, writer);
+  return writer;
+}
+
+function writeLogLine(projectId, logLine) {
+  try {
+    let writer = getLogWriter(projectId);
+    writer = rotateLogFileIfNeeded(projectId, writer.logPath, writer);
+    writer.stream.write(logLine);
+    writer.bytes += Buffer.byteLength(logLine);
+  } catch (err) {
+    console.error(`Failed to write log for ${projectId}:`, err.message);
+  }
+}
+
+function flushLogBroadcasts() {
+  logBroadcastTimer = null;
+  if (pendingLogBroadcasts.size === 0) return;
+  const batches = Array.from(pendingLogBroadcasts.entries());
+  pendingLogBroadcasts.clear();
+  for (const [projectId, entries] of batches) {
+    broadcastEvent('project-logs', { projectId, entries });
+  }
+}
+
+function queueLogBroadcast(projectId, entry, immediate) {
+  let list = pendingLogBroadcasts.get(projectId);
+  if (!list) {
+    list = [];
+    pendingLogBroadcasts.set(projectId, list);
+  }
+  list.push(entry);
+  if (list.length > MAX_MEMORY_LOGS) {
+    list.splice(0, list.length - MAX_MEMORY_LOGS);
+  }
+  if (immediate) {
+    if (logBroadcastTimer) {
+      clearTimeout(logBroadcastTimer);
+    }
+    flushLogBroadcasts();
+    return;
+  }
+  if (!logBroadcastTimer) {
+    logBroadcastTimer = setTimeout(flushLogBroadcasts, LOG_BROADCAST_INTERVAL_MS);
+  }
+}
+
+function appendLog(projectId, stream, rawText, alreadyClean = false) {
+  const cleanText = alreadyClean ? String(rawText) : stripAnsi(rawText);
   if (!cleanText.trim() && stream !== 'system') {
     return null;
   }
@@ -1759,26 +2169,29 @@ function appendLog(projectId, stream, rawText) {
   if (state.logs.length > MAX_MEMORY_LOGS) {
     state.logs.splice(0, state.logs.length - MAX_MEMORY_LOGS);
   }
-
-  const logLine = `[${entry.timestamp}] [${stream.toUpperCase()}] ${cleanText}\n`;
-  try {
-    fs.appendFileSync(getLogFilePath(projectId), logLine, 'utf8');
-  } catch (err) {
-    console.error(`Failed to write log for ${projectId}:`, err.message);
+  state.hasLog = true;
+  if (stream === 'stderr' || stream === 'stdout') {
+    if (stream === 'stderr' || /\b(error|err!|exception|traceback|panic|fatal|cannot find)\b/i.test(cleanText)) {
+      state.lastErrorLine = cleanText.trim().slice(0, 300);
+    }
   }
 
-  broadcastEvent('project-log', { projectId, entry });
+  writeLogLine(projectId, `[${entry.timestamp}] [${stream.toUpperCase()}] ${cleanText}\n`);
+  // System messages (started, stopped, crashed) go out right away; output is batched.
+  queueLogBroadcast(projectId, entry, stream === 'system');
   return entry;
 }
 
 function clearProbeTimer(state) {
   if (state.probeTimer) {
+    clearTimeout(state.probeTimer);
     clearInterval(state.probeTimer);
     state.probeTimer = null;
   }
 }
 
 function detectAndRecordUrl(project, lineText) {
+  if (project.kind === 'worker') return;
   const state = getRuntimeState(project.id);
   const match = lineText.match(LOCAL_URL_REGEX);
   if (match) {
@@ -1819,7 +2232,7 @@ function attachStreamReader(project, streamObj, streamName) {
     const cleaned = stripAnsi(line);
     if (!cleaned.trim()) return;
     detectAndRecordUrl(project, cleaned);
-    appendLog(project.id, streamName, cleaned);
+    appendLog(project.id, streamName, cleaned, true);
   };
 
   streamObj.on('data', (chunk) => {
@@ -1863,23 +2276,79 @@ async function isPortListening(port) {
   return v4 || v6;
 }
 
-async function findAvailablePort(startPort, excludeId) {
+/** Fast check: can we bind the port ourselves? Fails at once if anything holds it. */
+function canBindPort(port, host) {
+  return new Promise((resolve) => {
+    const tester = net.createServer();
+    tester.unref();
+    tester.once('error', (err) => {
+      // No IPv6 on this machine: that address can't be in use.
+      resolve(err && (err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT'));
+    });
+    tester.listen({ port, host, exclusive: true }, () => {
+      tester.close(() => resolve(true));
+    });
+  });
+}
+
+async function isPortFree(port) {
+  if (!(await canBindPort(port, '127.0.0.1'))) return false;
+  if (!(await canBindPort(port, '::1'))) return false;
+  // Some servers bind in ways a test bind doesn't collide with (notably on Windows),
+  // so finish with a real connection attempt.
+  return !(await isPortListening(port));
+}
+
+/** Ports handed to a project whose start is still in progress (filled before any await). */
+const pendingPorts = new Map();
+
+function getReservedPorts(excludeId) {
   const reserved = new Set();
   for (const [id, st] of runtimeState.entries()) {
-    if (id !== excludeId && st.status === 'running' && st.assignedPort) {
+    if (id !== excludeId && (st.process || st.startPromise) && st.assignedPort) {
       reserved.add(Number(st.assignedPort));
     }
   }
+  for (const [port, id] of pendingPorts.entries()) {
+    if (id !== excludeId) reserved.add(port);
+  }
+  return reserved;
+}
 
-  let candidate = Number(startPort) || 3000;
+async function findAvailablePort(startPort, excludeId) {
+  const candidate = Number(startPort) || 3000;
   for (let offset = 0; offset < 40; offset++) {
     const p = candidate + offset;
-    if (p === PORT) continue; // Skip DevDeck's own port
-    if (reserved.has(p)) continue;
-    const busy = await isPortListening(p);
-    if (!busy) return p;
+    if (p > 65535) break;
+    if (p === PORT || p === getListeningPortSafe()) continue; // Skip Portly's own port
+    if (getReservedPorts(excludeId).has(p)) continue;
+    pendingPorts.set(p, excludeId);
+    let free = false;
+    try {
+      free = await isPortFree(p);
+    } finally {
+      if (!free) pendingPorts.delete(p);
+    }
+    if (free) return p;
   }
-  return candidate;
+  const err = new Error(
+    `No free port found between ${candidate} and ${candidate + 39}. Stop something using those ports, or set a custom port for this project.`
+  );
+  err.statusCode = 409;
+  throw err;
+}
+
+function releasePendingPort(port, id) {
+  if (pendingPorts.get(port) === id) pendingPorts.delete(port);
+}
+
+function getListeningPortSafe() {
+  try {
+    const addr = server.address();
+    return typeof addr === 'object' && addr ? addr.port : PORT;
+  } catch {
+    return PORT;
+  }
 }
 
 function buildEffectiveCommand(project, assignedPort) {
@@ -1934,22 +2403,27 @@ function startActivePortProbe(project, state, targetPort) {
   clearProbeTimer(state);
   if (!targetPort) return;
 
-  let attempts = 0;
-  state.probeTimer = setInterval(async () => {
-    attempts += 1;
-    if (state.status !== 'running' || state.detectedUrl || attempts > 45) {
-      clearProbeTimer(state);
+  const child = state.process;
+  const startedAt = Date.now();
+  let delay = 500;
+  const tick = async () => {
+    state.probeTimer = null;
+    // Give up after ~60 s, or if this run has ended or a URL was already found.
+    if (state.process !== child || state.status !== 'running' || state.detectedUrl || Date.now() - startedAt > 60000) {
       return;
     }
-
     const open = await isPortListening(targetPort);
+    if (state.process !== child) return;
     if (open && state.status === 'running' && !state.detectedUrl) {
       state.detectedUrl = `http://localhost:${targetPort}`;
-      clearProbeTimer(state);
       appendLog(project.id, 'system', `Live server detected at ${state.detectedUrl}`);
       broadcastProjectStatus(project);
+      return;
     }
-  }, 800);
+    delay = Math.min(2000, Math.round(delay * 1.4));
+    state.probeTimer = setTimeout(tick, delay);
+  };
+  state.probeTimer = setTimeout(tick, delay);
 }
 
 function findProjectOrThrow(id) {
@@ -1962,22 +2436,84 @@ function findProjectOrThrow(id) {
   return project;
 }
 
-function buildCrossPlatformEnv(assignedPort, projectPath = '') {
-  const portStr = String(assignedPort);
+/** PATH from the user's login shell (macOS/Linux), so nvm, volta, fnm, asdf and pyenv work. */
+let loginShellPath = null;
+let loginShellPathPromise = null;
+
+function loadLoginShellPath() {
+  if (process.platform === 'win32') return Promise.resolve(null);
+  if (loginShellPathPromise) return loginShellPathPromise;
+  loginShellPathPromise = new Promise((resolve) => {
+    const shell = process.env.SHELL || '/bin/sh';
+    const marker = '__PORTLY_PATH__';
+    let out = '';
+    let child;
+    try {
+      child = spawn(shell, ['-ilc', `printf '${marker}%s${marker}' "$PATH"`], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, DISABLE_AUTO_UPDATE: 'true' }
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      resolve(null);
+    }, 4000);
+    child.stdout.on('data', (d) => {
+      out += d.toString('utf8');
+    });
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.on('close', () => {
+      clearTimeout(timer);
+      const match = out.match(new RegExp(`${marker}(.*?)${marker}`, 's'));
+      loginShellPath = match && match[1].trim() ? match[1].trim() : null;
+      resolve(loginShellPath);
+    });
+  });
+  return loginShellPathPromise;
+}
+
+function buildCrossPlatformEnv(assignedPort, projectPath = '', extraEnv = {}) {
   const existingPath =
     process.env.PATH || process.env.Path || process.env.path || '';
   const env = {
     ...process.env,
     FORCE_COLOR: '0',
-    BROWSER: 'none',
-    PORT: portStr,
-    SERVER_PORT: portStr,
-    FLASK_RUN_PORT: portStr,
-    STREAMLIT_SERVER_PORT: portStr,
-    GRADIO_SERVER_PORT: portStr,
-    ROCKET_PORT: portStr,
-    ASPNETCORE_URLS: `http://localhost:${portStr}`
+    BROWSER: 'none'
   };
+  // The project's own variables (stack, then service). PATH is never taken from here.
+  for (const [key, value] of Object.entries(extraEnv || {})) {
+    if (key.toLowerCase() === 'path') continue;
+    if (process.platform === 'win32') {
+      // Windows variable names ignore case: replace the existing spelling instead of adding a twin.
+      for (const existing of Object.keys(env)) {
+        if (existing !== key && existing.toLowerCase() === key.toLowerCase()) delete env[existing];
+      }
+    }
+    env[key] = value;
+  }
+  // Portly's port variables always win, so the app listens where Portly expects it.
+  if (assignedPort) {
+    const portStr = String(assignedPort);
+    Object.assign(env, {
+      PORT: portStr,
+      SERVER_PORT: portStr,
+      FLASK_RUN_PORT: portStr,
+      STREAMLIT_SERVER_PORT: portStr,
+      GRADIO_SERVER_PORT: portStr,
+      ROCKET_PORT: portStr,
+      ASPNETCORE_URLS: `http://localhost:${portStr}`
+    });
+  }
 
   for (const key of Object.keys(env)) {
     if (key.toLowerCase() === 'path') {
@@ -2003,6 +2539,7 @@ function buildCrossPlatformEnv(assignedPort, projectPath = '') {
 
   if (process.platform !== 'win32') {
     const home = os.homedir();
+    const shellParts = loginShellPath ? loginShellPath.split(path.delimiter).filter(Boolean) : [];
     const extraPaths = [
       '/opt/homebrew/bin',
       '/opt/homebrew/sbin',
@@ -2014,11 +2551,17 @@ function buildCrossPlatformEnv(assignedPort, projectPath = '') {
       path.join(home, '.bun', 'bin'),
       path.join(home, '.cargo', 'bin'),
       path.join(home, 'go', 'bin'),
+      path.join(home, '.volta', 'bin'),
+      path.join(home, '.asdf', 'shims'),
+      path.join(home, '.pyenv', 'shims'),
+      path.join(home, '.rbenv', 'shims'),
       '/snap/bin'
     ];
-    env.PATH = Array.from(new Set([...localBins, ...extraPaths, ...currentParts])).join(
-      path.delimiter
-    );
+    // The user's own PATH (and their login shell's) comes first, so the Node or Python
+    // version they picked wins; the fixed folders are only a fallback.
+    env.PATH = Array.from(
+      new Set([...localBins, ...shellParts, ...currentParts, ...extraPaths])
+    ).join(path.delimiter);
   } else {
     const sysRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
     const winDefaults = [
@@ -2067,18 +2610,51 @@ function spawnProjectCommand(command, cwd, env) {
   });
 }
 
+function describePortOwner(port, excludeId) {
+  for (const p of projects) {
+    if (p.id === excludeId) continue;
+    const st = getRuntimeState(p.id);
+    if ((st.process || st.startPromise) && Number(st.assignedPort) === Number(port)) {
+      return p;
+    }
+  }
+  return null;
+}
+
 async function startProject(id) {
   const project = findProjectOrThrow(id);
   const state = getRuntimeState(id);
 
-  if (state.status === 'running' && state.process) {
+  // A start is already in progress: wait for it instead of spawning a second server.
+  if (state.startPromise) {
+    return state.startPromise;
+  }
+  // Stop in progress (for example a restart): let it finish first.
+  if (state.stopPromise) {
+    await state.stopPromise.catch(() => {});
+    return startProject(id);
+  }
+  if (state.process) {
     return serializeProject(project);
   }
 
+  state.startPromise = runStart(project, state).finally(() => {
+    state.startPromise = null;
+  });
+  return state.startPromise;
+}
+
+async function runStart(project, state) {
   if (!fs.existsSync(project.path)) {
-    const err = new Error(`Project directory does not exist: ${project.path}`);
+    const err = new Error(
+      `Can't find this project's folder. It may have been moved or renamed: ${project.path}`
+    );
     err.statusCode = 400;
     throw err;
+  }
+
+  if (process.platform !== 'win32') {
+    await loadLoginShellPath();
   }
 
   // Re-inspect right before start so fresh projects/edits get optimal defaults
@@ -2093,12 +2669,42 @@ async function startProject(id) {
   }
 
   const desiredPort = Number(project.customPort || project.defaultPort || 3000);
-  const assignedPort = project.customPort
-    ? desiredPort
-    : await findAvailablePort(desiredPort, project.id);
+  let assignedPort;
+  let portBusyByOtherProgram = false;
+  if (project.kind === 'worker') {
+    // Workers (queues, schedulers, watchers) don't serve a page: no port, no Open link.
+    assignedPort = null;
+  } else if (project.customPort) {
+    assignedPort = desiredPort;
+    if (assignedPort === PORT || assignedPort === getListeningPortSafe()) {
+      const err = new Error(
+        `Port ${assignedPort} is used by Portly itself. Pick a different custom port for this project.`
+      );
+      err.statusCode = 409;
+      throw err;
+    }
+    const owner = describePortOwner(assignedPort, project.id);
+    if (owner || pendingPorts.has(assignedPort)) {
+      const err = new Error(
+        `Port ${assignedPort} is already used by ${owner ? `"${owner.name}"` : 'another project that is starting'}. Stop it first or change one of the custom ports.`
+      );
+      err.statusCode = 409;
+      throw err;
+    }
+    pendingPorts.set(assignedPort, project.id);
+    portBusyByOtherProgram = !(await isPortFree(assignedPort));
+  } else {
+    assignedPort = await findAvailablePort(desiredPort, project.id);
+  }
 
   const command = buildEffectiveCommand(project, assignedPort);
-  const env = buildCrossPlatformEnv(assignedPort, project.path);
+  let env;
+  try {
+    env = buildCrossPlatformEnv(assignedPort, project.path, composeProjectEnv(project, assignedPort));
+  } catch (err) {
+    if (assignedPort) releasePendingPort(assignedPort, project.id);
+    throw err;
+  }
 
   state.status = 'running';
   state.startedAt = Date.now();
@@ -2106,28 +2712,66 @@ async function startProject(id) {
   state.detectedUrl = null;
   state.assignedPort = assignedPort;
   state.stopping = false;
+  state.lastErrorLine = null;
+  state.crashReason = null;
+  state.portConflict = portBusyByOtherProgram;
 
-  const child = spawnProjectCommand(command, project.path, env);
+  let child;
+  try {
+    child = spawnProjectCommand(command, project.path, env);
+  } catch (err) {
+    releasePendingPort(assignedPort, project.id);
+    resetRuntimeState(state, 'crashed');
+    state.exitCode = -1;
+    state.crashReason = `Couldn't start: ${err.message}`;
+    appendLog(project.id, 'system', `Failed to start process: ${err.message}`);
+    broadcastProjectStatus(project);
+    throw err;
+  }
+  releasePendingPort(assignedPort, project.id);
 
   state.process = child;
   state.pid = child.pid || null;
+  let resolveExit;
+  state.exitPromise = new Promise((resolve) => {
+    resolveExit = resolve;
+  });
 
   project.lastStartedAt = new Date().toISOString();
   saveProjects();
 
-  const portNotice =
-    !project.customPort && assignedPort !== desiredPort
+  const portNotice = !assignedPort
+    ? ' [worker, no port]'
+    : !project.customPort && assignedPort !== desiredPort
       ? ` [Port ${desiredPort} was busy -> assigned PORT=${assignedPort}]`
       : ` [PORT=${assignedPort}]`;
+  const userEnvCount =
+    Object.keys(envStore.activeVars(project.id)).length +
+    (project.stackId ? Object.keys(envStore.activeVars(project.stackId)).length : 0);
 
   appendLog(
     project.id,
     'system',
     `Started "${command}" (${project.programType || project.framework})${portNotice} in ${project.path} (PID: ${child.pid || 'unknown'})`
   );
+  if (userEnvCount > 0) {
+    // Names only: values can be secrets and logs end up in crash reports.
+    const profile = envStore.summary(project.id).activeProfile;
+    appendLog(project.id, 'system', `Added ${userEnvCount} environment variable${userEnvCount === 1 ? '' : 's'} (profile: ${profile}).`);
+  }
+  if (portBusyByOtherProgram) {
+    appendLog(
+      project.id,
+      'system',
+      `Warning: port ${assignedPort} was already in use by another program before this project started. The app may fail to start, and the Open link may show that other program.`
+    );
+  }
   broadcastProjectStatus(project);
 
-  startActivePortProbe(project, state, assignedPort);
+  // Only probe for "is it up yet" when we know nothing else was answering on the port.
+  if (!portBusyByOtherProgram) {
+    startActivePortProbe(project, state, assignedPort);
+  }
 
   const flushStdout = child.stdout
     ? attachStreamReader(project, child.stdout, 'stdout')
@@ -2136,142 +2780,118 @@ async function startProject(id) {
     ? attachStreamReader(project, child.stderr, 'stderr')
     : () => {};
 
-  child.on('error', (err) => {
-    clearProbeTimer(state);
+  let exited = false;
+  const onExit = (code, signal, spawnError) => {
+    if (exited) return;
+    exited = true;
     flushStdout();
     flushStderr();
-    state.status = 'crashed';
-    state.pid = null;
-    state.startedAt = null;
-    state.detectedUrl = null;
-    state.assignedPort = null;
-    state.process = null;
-    state.exitCode = -1;
-    appendLog(project.id, 'system', `Failed to start process: ${err.message}`);
-    broadcastProjectStatus(project);
-  });
+    resolveExit();
 
-  child.on('close', (code, signal) => {
-    clearProbeTimer(state);
-    flushStdout();
-    flushStderr();
+    // This exit belongs to an older run (the project was stopped and started again in the
+    // meantime): record it in the log only, and leave the new run's state alone.
+    if (state.process !== child) {
+      return;
+    }
 
     const wasStopping = state.stopping;
-    state.stopping = false;
-    state.status = wasStopping ? 'stopped' : code === 0 ? 'stopped' : 'crashed';
-    state.pid = null;
-    state.startedAt = null;
-    state.detectedUrl = null;
-    state.assignedPort = null;
-    state.process = null;
-    state.exitCode = typeof code === 'number' ? code : null;
-
-    const reason = wasStopping
-      ? 'Process stopped by user.'
-      : `Process exited with code ${code}${signal ? ` (signal: ${signal})` : ''}`;
+    let reason;
+    let nextStatus;
+    if (spawnError) {
+      nextStatus = 'crashed';
+      reason = `Failed to start process: ${spawnError.message}`;
+      state.exitCode = -1;
+      state.crashReason = `Couldn't start: ${spawnError.message}`;
+    } else {
+      nextStatus = wasStopping || code === 0 ? 'stopped' : 'crashed';
+      state.exitCode = typeof code === 'number' ? code : null;
+      reason = wasStopping
+        ? 'Process stopped by user.'
+        : `Process exited with code ${code}${signal ? ` (signal: ${signal})` : ''}`;
+      if (nextStatus === 'crashed') {
+        const last = state.lastErrorLine ? `: ${state.lastErrorLine}` : '';
+        state.crashReason = `Exited (code ${code === null ? signal || 'unknown' : code})${last}`;
+      }
+    }
+    resetRuntimeState(state, nextStatus);
     appendLog(project.id, 'system', reason);
     broadcastProjectStatus(project);
-  });
+    // Release the log file handle while nothing is running (Windows locks open files).
+    closeLogWriter(project.id);
+  };
+
+  child.on('error', (err) => onExit(null, null, err));
+  child.on('close', (code, signal) => onExit(code, signal, null));
 
   return serializeProject(project);
 }
 
-function stopProject(id) {
-  const project = findProjectOrThrow(id);
-  const state = getRuntimeState(id);
-  clearProbeTimer(state);
-
-  if (!state.process || !state.pid) {
-    state.status = 'stopped';
-    state.pid = null;
-    state.startedAt = null;
-    state.detectedUrl = null;
-    state.assignedPort = null;
-    state.process = null;
-    state.stopping = false;
-    broadcastProjectStatus(project);
-    return Promise.resolve(serializeProject(project));
-  }
-
-  const pidToKill = state.pid;
-  state.stopping = true;
-  appendLog(project.id, 'system', `Stopping process tree (PID: ${pidToKill})...`);
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearProbeTimer(state);
-      state.status = 'stopped';
-      state.pid = null;
-      state.startedAt = null;
-      state.detectedUrl = null;
-      state.assignedPort = null;
-      state.process = null;
-      state.stopping = false;
-      broadcastProjectStatus(project);
-      resolve(serializeProject(project));
-    };
-
-    if (process.platform === 'win32') {
+function killProcessTree(pidToKill, child) {
+  if (process.platform === 'win32') {
+    return new Promise((resolve) => {
       const sysRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
       const taskkillDefault = path.join(sysRoot, 'System32', 'taskkill.exe');
       const taskkillBin = fs.existsSync(taskkillDefault) ? taskkillDefault : 'taskkill';
-      const killer = spawn(taskkillBin, ['/PID', String(pidToKill), '/T', '/F'], {
-        windowsHide: true
-      });
-
-      const timeout = setTimeout(() => {
-        finish();
-      }, 4000);
-
-      killer.on('close', () => {
-        clearTimeout(timeout);
-        setTimeout(finish, 120);
-      });
-
+      let killer;
+      try {
+        killer = spawn(taskkillBin, ['/PID', String(pidToKill), '/T', '/F'], {
+          windowsHide: true
+        });
+      } catch {
+        killer = null;
+      }
+      if (!killer) {
+        try {
+          child?.kill();
+        } catch {
+          // ignore
+        }
+        resolve(false);
+        return;
+      }
+      killer.on('close', (code) => resolve(code === 0));
       killer.on('error', () => {
-        clearTimeout(timeout);
+        // taskkill unavailable: this only ends cmd.exe, so the server under it may survive.
         try {
-          state.process?.kill();
+          child?.kill();
         } catch {
-          // Ignore fallback kill error
+          // ignore
         }
-        finish();
+        resolve(false);
       });
-      return;
+    });
+  }
+
+  // POSIX (macOS / Linux): terminate process group (-pid) first, then escalate to SIGKILL
+  const signalGroupOrPid = (sig) => {
+    try {
+      process.kill(-pidToKill, sig);
+      return true;
+    } catch {
+      try {
+        process.kill(pidToKill, sig);
+        return true;
+      } catch {
+        return false;
+      }
     }
+  };
 
-    // POSIX (macOS / Linux): terminate process group (-pid) first, then escalate to SIGKILL
-    const signalGroupOrPid = (sig) => {
+  const isGroupOrPidAlive = () => {
+    try {
+      process.kill(-pidToKill, 0);
+      return true;
+    } catch {
       try {
-        process.kill(-pidToKill, sig);
+        process.kill(pidToKill, 0);
         return true;
       } catch {
-        try {
-          process.kill(pidToKill, sig);
-          return true;
-        } catch {
-          return false;
-        }
+        return false;
       }
-    };
+    }
+  };
 
-    const isGroupOrPidAlive = () => {
-      try {
-        process.kill(-pidToKill, 0);
-        return true;
-      } catch {
-        try {
-          process.kill(pidToKill, 0);
-          return true;
-        } catch {
-          return false;
-        }
-      }
-    };
-
+  return new Promise((resolve) => {
     signalGroupOrPid('SIGTERM');
     try {
       spawn('pkill', ['-TERM', '-P', String(pidToKill)], { stdio: 'ignore' }).on('error', () => {});
@@ -2284,7 +2904,7 @@ function stopProject(id) {
       elapsed += 120;
       if (!isGroupOrPidAlive()) {
         clearInterval(pollInterval);
-        finish();
+        resolve(true);
         return;
       }
       if (elapsed >= 1200) {
@@ -2298,16 +2918,88 @@ function stopProject(id) {
         } catch {
           // pkill optional
         }
-        setTimeout(finish, 120);
+        setTimeout(() => resolve(true), 120);
       }
     }, 120);
   });
 }
 
+async function stopProject(id) {
+  const project = findProjectOrThrow(id);
+  const state = getRuntimeState(id);
+
+  // Let an in-flight start finish so its process can be stopped too.
+  if (state.startPromise) {
+    await state.startPromise.catch(() => {});
+  }
+  if (state.stopPromise) {
+    return state.stopPromise;
+  }
+
+  if (!state.process) {
+    resetRuntimeState(state, 'stopped');
+    broadcastProjectStatus(project);
+    return serializeProject(project);
+  }
+
+  state.stopPromise = runStop(project, state).finally(() => {
+    state.stopPromise = null;
+  });
+  return state.stopPromise;
+}
+
+async function runStop(project, state) {
+  clearProbeTimer(state);
+  const child = state.process;
+  const pidToKill = state.pid;
+  const exitPromise = state.exitPromise || Promise.resolve();
+  state.stopping = true;
+  appendLog(project.id, 'system', `Stopping process tree (PID: ${pidToKill || 'unknown'})...`);
+
+  let killed = true;
+  if (pidToKill) {
+    killed = await killProcessTree(pidToKill, child);
+  } else {
+    try {
+      child.kill();
+    } catch {
+      // ignore
+    }
+  }
+
+  // Wait for the child's real exit; fall back to a timeout if it never reports one.
+  let timer;
+  const exitedInTime = await Promise.race([
+    exitPromise.then(() => true),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), 5000);
+    })
+  ]);
+  clearTimeout(timer);
+
+  if (state.process === child) {
+    // The close event never came: mark it stopped ourselves. A late close is ignored,
+    // because it no longer matches state.process.
+    resetRuntimeState(state, 'stopped');
+    if (!exitedInTime || !killed) {
+      appendLog(
+        project.id,
+        'system',
+        `Portly couldn't confirm that process ${pidToKill} exited. If the port stays busy, end it in your task manager.`
+      );
+    } else {
+      appendLog(project.id, 'system', 'Process stopped by user.');
+    }
+    broadcastProjectStatus(project);
+    closeLogWriter(project.id);
+  }
+  return serializeProject(project);
+}
+
 async function restartProject(id) {
   const project = findProjectOrThrow(id);
   const state = getRuntimeState(id);
-  if (state.status === 'running' && state.pid) {
+  if (state.process || state.startPromise) {
     await stopProject(id);
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -2319,12 +3011,836 @@ async function stopAllProjects() {
   const runningIds = [];
   for (const p of projects) {
     const state = getRuntimeState(p.id);
-    if (state.status === 'running' && state.pid) {
+    if (state.process || state.startPromise) {
       runningIds.push(p.id);
     }
   }
-  await Promise.all(runningIds.map((id) => stopProject(id)));
+  await Promise.all(runningIds.map((id) => stopProject(id).catch(() => null)));
   return projects.map(serializeProject);
+}
+
+// ---------------------------------------------------------------------------------------
+// Stacks, per-project environment variables and named URLs (Nov 2026 roadmap items 1-3).
+//
+// A Stack groups several services (frontend, API, worker, database...) under one name.
+// Each service is an ordinary project record with a `stackId`, so logs, ports, crash
+// reports and the MCP tools keep working per service. A project without `stackId` is a
+// stand-alone project, exactly as before.
+// ---------------------------------------------------------------------------------------
+
+const SERVICE_KINDS = new Set(['server', 'worker']);
+
+/** @type {Map<string, { startPromise: Promise|null, runToken: number }>} */
+const stackRuntime = new Map();
+
+const envStore = envStoreLib.createEnvStore(ENV_VARS_FILE, null);
+
+/** Electron sets this to its safeStorage so env values are encrypted at rest. */
+function setSecretCodec(codec) {
+  envStore.setCodec(codec);
+}
+
+const namedUrlProxy = namedUrls.createNamedUrlProxy({
+  resolve: resolveNamedHost,
+  listNames: listNamedHosts,
+  forbiddenPorts: () => [PORT, getListeningPortSafe()]
+});
+
+function getStackRuntime(id) {
+  let rt = stackRuntime.get(id);
+  if (!rt) {
+    rt = { startPromise: null, runToken: 0 };
+    stackRuntime.set(id, rt);
+  }
+  return rt;
+}
+
+function saveStacks() {
+  ensureDirectories();
+  writeJsonAtomic(STACKS_FILE, stacks);
+}
+
+function loadStacks() {
+  stacks = [];
+  if (fs.existsSync(STACKS_FILE)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(STACKS_FILE, 'utf8').replace(/^﻿/, ''));
+      if (Array.isArray(parsed)) {
+        stacks = parsed.filter(
+          (s) => s && typeof s === 'object' && typeof s.id === 'string' && typeof s.name === 'string'
+        );
+      }
+    } catch (err) {
+      const movedTo = quarantineCorruptFile(STACKS_FILE);
+      startupNotices.push({
+        level: 'warning',
+        message: `Portly couldn't read your stacks, so their services now show as separate projects.${movedTo ? ` The damaged file was kept at ${movedTo}.` : ''}`
+      });
+    }
+  }
+  repairStacksAndHostnames();
+}
+
+/** Drops broken links (missing stacks, unknown start-after ids) and fills in web addresses. */
+function repairStacksAndHostnames() {
+  let projectsChanged = false;
+  let stacksChanged = false;
+  const stackIds = new Set(stacks.map((s) => s.id));
+  for (const p of projects) {
+    if (p.stackId && !stackIds.has(p.stackId)) {
+      delete p.stackId;
+      delete p.startAfter;
+      projectsChanged = true;
+    }
+    if (p.kind !== undefined && !SERVICE_KINDS.has(p.kind)) {
+      p.kind = 'server';
+      projectsChanged = true;
+    }
+  }
+  for (const p of projects) {
+    if (!p.stackId) continue;
+    const siblings = new Set(projects.filter((o) => o.stackId === p.stackId && o.id !== p.id).map((o) => o.id));
+    const cleaned = (Array.isArray(p.startAfter) ? p.startAfter : []).filter((id) => siblings.has(id));
+    if (!Array.isArray(p.startAfter) || cleaned.length !== p.startAfter.length) {
+      p.startAfter = cleaned;
+      projectsChanged = true;
+    }
+  }
+  for (const s of stacks) {
+    if (!s.hostname) {
+      s.hostname = uniqueHostname(namedUrls.slugifyHostname(s.name), { stackId: s.id });
+      stacksChanged = true;
+    }
+    const services = projects.filter((p) => p.stackId === s.id);
+    if (s.primaryServiceId && !services.some((p) => p.id === s.primaryServiceId)) {
+      s.primaryServiceId = null;
+      stacksChanged = true;
+    }
+  }
+  for (const p of projects) {
+    if (!p.hostname) {
+      p.hostname = defaultHostnameFor(p);
+      projectsChanged = true;
+    }
+  }
+  if (projectsChanged) saveProjects();
+  if (stacksChanged) saveStacks();
+}
+
+function isHostnameTaken(name, { projectId = null, stackId = null } = {}) {
+  return (
+    projects.some((p) => p.id !== projectId && p.hostname === name) ||
+    stacks.some((s) => s.id !== stackId && s.hostname === name)
+  );
+}
+
+function uniqueHostname(base, owner = {}) {
+  let candidate = base;
+  let i = 2;
+  while (isHostnameTaken(candidate, owner)) {
+    candidate = `${base}-${i++}`;
+  }
+  return candidate;
+}
+
+function defaultHostnameFor(project) {
+  const own = namedUrls.slugifyHostname(project.name);
+  const stack = project.stackId ? stacks.find((s) => s.id === project.stackId) : null;
+  const base = stack && stack.hostname ? `${own}.${stack.hostname}` : own;
+  return uniqueHostname(base, { projectId: project.id });
+}
+
+/** Validates a web address the user typed and checks that nothing else uses it. */
+function claimHostname(raw, owner) {
+  const name = namedUrls.normalizeHostnameInput(raw);
+  if (isHostnameTaken(name, owner)) {
+    const err = new Error(`${name}.localhost is already used by another project.`);
+    err.statusCode = 409;
+    throw err;
+  }
+  return name;
+}
+
+function findStackOrThrow(id) {
+  const stack = stacks.find((s) => s.id === id);
+  if (!stack) {
+    const err = new Error('Stack not found.');
+    err.statusCode = 404;
+    throw err;
+  }
+  return stack;
+}
+
+function getStackServices(stackId) {
+  return projects.filter((p) => p.stackId === stackId);
+}
+
+/**
+ * Orders services so that each comes after everything in its startAfter list.
+ * Throws a 400 error naming the loop when the rules go round in a circle.
+ */
+function orderStackServices(services) {
+  const byId = new Map(services.map((s) => [s.id, s]));
+  const ordered = [];
+  const mark = new Map(); // id -> 1 visiting, 2 done
+  const visit = (svc, trail) => {
+    const m = mark.get(svc.id);
+    if (m === 2) return;
+    if (m === 1) {
+      const loop = [...trail.slice(trail.indexOf(svc.id)), svc.id].map((id) => byId.get(id).name);
+      const err = new Error(`These services wait for each other in a loop: ${loop.join(' → ')}. Remove one of the "start after" rules.`);
+      err.statusCode = 400;
+      throw err;
+    }
+    mark.set(svc.id, 1);
+    for (const depId of svc.startAfter || []) {
+      const dep = byId.get(depId);
+      if (dep) visit(dep, [...trail, svc.id]);
+    }
+    mark.set(svc.id, 2);
+    ordered.push(svc);
+  };
+  // Keep the saved order where the rules allow it.
+  for (const svc of services) visit(svc, []);
+  return ordered;
+}
+
+function isServiceProcessUp(state) {
+  return Boolean(state.process || state.startPromise);
+}
+
+function serializeStack(stack) {
+  const services = getStackServices(stack.id);
+  let ordered = services;
+  try {
+    ordered = orderStackServices(services);
+  } catch {
+    // a loop is reported when the user tries to start it
+  }
+  const rt = getStackRuntime(stack.id);
+  let running = 0;
+  let crashed = 0;
+  let starting = 0;
+  for (const svc of services) {
+    const st = getRuntimeState(svc.id);
+    if (st.status === 'crashed') crashed += 1;
+    if (isServiceProcessUp(st) && st.status === 'running') {
+      running += 1;
+      if (svc.kind !== 'worker' && !st.detectedUrl) starting += 1;
+    }
+  }
+  let status = 'stopped';
+  if (rt.startPromise) status = 'starting';
+  else if (crashed > 0) status = 'crashed';
+  else if (running > 0 && running === services.length) status = starting > 0 ? 'starting' : 'running';
+  else if (running > 0) status = 'partial';
+
+  const primary = getPrimaryService(stack);
+  return {
+    id: stack.id,
+    name: stack.name,
+    path: stack.path || '',
+    hostname: stack.hostname,
+    namedUrl: getNamedUrlFor(stack.hostname, primary),
+    primaryServiceId: primary ? primary.id : null,
+    primaryServiceIsDefault: !stack.primaryServiceId,
+    serviceIds: ordered.map((s) => s.id),
+    status,
+    counts: { total: services.length, running, crashed },
+    env: envStore.summary(stack.id),
+    createdAt: stack.createdAt || null
+  };
+}
+
+function listStacksSerialized() {
+  return stacks.map(serializeStack);
+}
+
+function broadcastStackStatus(stackId) {
+  const stack = stacks.find((s) => s.id === stackId);
+  if (stack) broadcastEvent('stack-status', serializeStack(stack));
+}
+
+/** The service a stack's own address (shop.localhost) opens: chosen, else the last web service. */
+function getPrimaryService(stack) {
+  const services = getStackServices(stack.id);
+  if (stack.primaryServiceId) {
+    const chosen = services.find((s) => s.id === stack.primaryServiceId);
+    if (chosen) return chosen;
+  }
+  let ordered = services;
+  try {
+    ordered = orderStackServices(services);
+  } catch {
+    // keep saved order
+  }
+  const web = ordered.filter((s) => s.kind !== 'worker');
+  return web.length ? web[web.length - 1] : null;
+}
+
+// ------------------------------ named URLs ------------------------------
+
+function getNamedUrlFor(hostname, project) {
+  if (!settings.namedUrls || !namedUrlProxy.isRunning() || !hostname) return null;
+  if (project && project.kind === 'worker') return null;
+  return namedUrls.buildNamedUrl(hostname, namedUrlProxy.getPort());
+}
+
+function routeTargetFor(project) {
+  if (!project) return null;
+  const st = getRuntimeState(project.id);
+  return {
+    name: project.name,
+    port: st.assignedPort || null,
+    running: Boolean(st.process) && st.status === 'running' && project.kind !== 'worker'
+  };
+}
+
+function resolveNamedHost(name) {
+  const project = projects.find((p) => p.hostname === name);
+  if (project) return routeTargetFor(project);
+  const stack = stacks.find((s) => s.hostname === name);
+  if (stack) {
+    const primary = getPrimaryService(stack);
+    if (!primary) return { name: stack.name, port: null, running: false };
+    return { ...routeTargetFor(primary), name: stack.name };
+  }
+  return null;
+}
+
+function listNamedHosts() {
+  const out = [];
+  for (const s of stacks) {
+    const target = resolveNamedHost(s.hostname);
+    out.push({ hostname: s.hostname, name: s.name, running: Boolean(target && target.running) });
+  }
+  for (const p of projects) {
+    if (p.kind === 'worker') continue;
+    const t = routeTargetFor(p);
+    out.push({ hostname: p.hostname, name: p.name, running: t.running });
+  }
+  return out;
+}
+
+/** Starts, restarts or stops the proxy to match the settings. Never throws. */
+async function syncNamedUrlProxy() {
+  // PORTLY_PROXY_PORT overrides the setting (tests and side-by-side dev copies use it).
+  const wantPort = process.env.PORTLY_PROXY_PORT !== undefined
+    ? normalizeProxyPort(process.env.PORTLY_PROXY_PORT, 0)
+    : normalizeProxyPort(settings.proxyPort);
+  let result;
+  if (!settings.namedUrls) {
+    await namedUrlProxy.stop();
+    result = { ok: true, running: false };
+  } else if (namedUrlProxy.isRunning() && (namedUrlProxy.getPort() === wantPort || wantPort === 0)) {
+    result = { ok: true, running: true, port: wantPort };
+  } else if (wantPort === PORT || wantPort === getListeningPortSafe()) {
+    await namedUrlProxy.stop();
+    result = { ok: false, running: false, error: `Port ${wantPort} is Portly's own port. Pick another port for named URLs.` };
+  } else {
+    const started = await namedUrlProxy.start(wantPort);
+    result = started.ok
+      ? { ok: true, running: true, port: started.port }
+      : { ok: false, running: false, error: started.error };
+  }
+  broadcastEvent('named-urls', getNamedUrlStatus());
+  broadcastEvent('projects-refresh', { projects: listProjectsWithStatus(), stacks: listStacksSerialized() });
+  return result;
+}
+
+function getNamedUrlStatus() {
+  return {
+    enabled: Boolean(settings.namedUrls),
+    running: namedUrlProxy.isRunning(),
+    port: namedUrlProxy.getPort() || normalizeProxyPort(settings.proxyPort),
+    error: settings.namedUrls && !namedUrlProxy.isRunning() ? namedUrlProxy.getError() : null
+  };
+}
+
+// ------------------------------ environment ------------------------------
+
+/** Turns "Payments API" into "PAYMENTS_API" for PORTLY_<NAME>_URL style variables. */
+function envNameFor(name) {
+  const slug = String(name || '')
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return slug ? (/^[0-9]/.test(slug) ? `S_${slug}` : slug) : 'SERVICE';
+}
+
+/**
+ * Variables Portly adds for a project, then the user's own (stack first, then the service),
+ * with ${NAME} references expanded. Portly's port variables are added later and win.
+ */
+function composeProjectEnv(project, assignedPort) {
+  const portlyVars = { PORTLY_PROJECT: project.name };
+  const ownNamed = getNamedUrlFor(project.hostname, project);
+  if (assignedPort) {
+    portlyVars.PORTLY_URL = `http://localhost:${assignedPort}`;
+  }
+  if (ownNamed) portlyVars.PORTLY_NAMED_URL = ownNamed;
+
+  if (project.stackId) {
+    const stack = stacks.find((s) => s.id === project.stackId);
+    if (stack) {
+      portlyVars.PORTLY_STACK = stack.name;
+      const stackUrl = getNamedUrlFor(stack.hostname, getPrimaryService(stack));
+      if (stackUrl) portlyVars.PORTLY_STACK_URL = stackUrl;
+    }
+    // Siblings that are already up (anything this service starts after is up by now).
+    for (const sib of getStackServices(project.stackId)) {
+      if (sib.id === project.id || sib.kind === 'worker') continue;
+      const st = getRuntimeState(sib.id);
+      if (!st.process || !st.assignedPort) continue;
+      const key = envNameFor(sib.name);
+      portlyVars[`PORTLY_${key}_PORT`] = String(st.assignedPort);
+      portlyVars[`PORTLY_${key}_URL`] = `http://localhost:${st.assignedPort}`;
+      const sibNamed = getNamedUrlFor(sib.hostname, sib);
+      if (sibNamed) portlyVars[`PORTLY_${key}_NAMED_URL`] = sibNamed;
+    }
+  }
+
+  const composed = { ...portlyVars };
+  const portStr = assignedPort ? String(assignedPort) : undefined;
+  const lookup = (name) => {
+    if (composed[name] !== undefined) return composed[name];
+    if (portStr && (name === 'PORT' || name === 'SERVER_PORT')) return portStr;
+    return process.env[name];
+  };
+  const layers = [];
+  if (project.stackId) layers.push(envStore.activeVars(project.stackId));
+  layers.push(envStore.activeVars(project.id));
+  for (const layer of layers) {
+    for (const [key, value] of Object.entries(layer)) {
+      composed[key] = envStoreLib.expandReferences(value, lookup);
+    }
+  }
+  return composed;
+}
+
+function getEnvOwner(ownerId) {
+  const project = projects.find((p) => p.id === ownerId);
+  if (project) return { kind: 'project', owner: project, dir: project.path };
+  const stack = stacks.find((s) => s.id === ownerId);
+  if (stack) return { kind: 'stack', owner: stack, dir: stack.path || '' };
+  const err = new Error('Project or stack not found.');
+  err.statusCode = 404;
+  throw err;
+}
+
+function describeEnv(ownerId) {
+  const { kind, dir } = getEnvOwner(ownerId);
+  const cfg = envStore.get(ownerId);
+  return {
+    ownerId,
+    ownerKind: kind,
+    activeProfile: cfg.activeProfile,
+    profiles: cfg.profiles,
+    envFiles: dir && fs.existsSync(dir) ? envStoreLib.listEnvFiles(dir) : [],
+    encrypted: envStore.isEncrypted()
+  };
+}
+
+function afterEnvChange(ownerId) {
+  const project = projects.find((p) => p.id === ownerId);
+  if (project) broadcastProjectStatus(project);
+  else broadcastStackStatus(ownerId);
+}
+
+// ------------------------------ stack lifecycle ------------------------------
+
+function waitMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Resolves when a service can be relied on: a web service answers on its port (or printed
+ * its URL), a worker has stayed up briefly, or the service finished with exit code 0
+ * (one-off tasks such as migrations). Returns 'ready' | 'done' | 'failed' | 'timeout'.
+ */
+async function waitForServiceReady(project, isCancelled) {
+  const state = getRuntimeState(project.id);
+  const child = state.process;
+  const started = Date.now();
+  const limit = project.kind === 'worker' ? WORKER_READY_MS : STACK_READY_TIMEOUT_MS;
+  while (true) {
+    if (isCancelled()) return 'failed';
+    if (state.process !== child || !state.process) {
+      return state.status === 'crashed' ? 'failed' : 'done';
+    }
+    if (project.kind === 'worker') {
+      if (Date.now() - started >= limit) return 'ready';
+    } else {
+      if (state.detectedUrl) return 'ready';
+      if (state.assignedPort && (await isPortListening(state.assignedPort))) return 'ready';
+      if (Date.now() - started >= limit) return 'timeout';
+    }
+    await waitMs(250);
+  }
+}
+
+async function startStack(stackId) {
+  const stack = findStackOrThrow(stackId);
+  const rt = getStackRuntime(stackId);
+  if (rt.startPromise) return rt.startPromise;
+  const services = getStackServices(stackId);
+  if (services.length === 0) {
+    const err = new Error(`${stack.name} has no services yet. Add one first.`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const ordered = orderStackServices(services); // throws on a loop before anything starts
+  rt.runToken += 1;
+  const token = rt.runToken;
+  rt.startPromise = runStackStart(stack, ordered, () => rt.runToken !== token).finally(() => {
+    rt.startPromise = null;
+    broadcastStackStatus(stackId);
+  });
+  broadcastStackStatus(stackId);
+  return rt.startPromise;
+}
+
+async function runStackStart(stack, ordered, isCancelled) {
+  const outcome = new Map(); // id -> Promise<'ready'|'done'|'failed'|'timeout'|'skipped'>
+  const problems = [];
+
+  const startOne = (svc) => {
+    if (outcome.has(svc.id)) return outcome.get(svc.id);
+    const promise = (async () => {
+      const deps = (svc.startAfter || [])
+        .map((id) => ordered.find((o) => o.id === id))
+        .filter(Boolean);
+      const depResults = await Promise.all(deps.map((d) => startOne(d)));
+      if (isCancelled()) return 'skipped';
+      const failedDeps = deps.filter((d, i) => depResults[i] === 'failed' || depResults[i] === 'skipped');
+      if (failedDeps.length) {
+        const names = failedDeps.map((d) => d.name).join(', ');
+        appendLog(svc.id, 'system', `Not started, because ${names} didn't start.`);
+        problems.push(`${svc.name} wasn't started because ${names} didn't start.`);
+        return 'skipped';
+      }
+      deps.forEach((d, i) => {
+        if (depResults[i] === 'timeout') {
+          appendLog(
+            svc.id,
+            'system',
+            `${d.name} didn't answer on its port within ${Math.round(STACK_READY_TIMEOUT_MS / 1000)} s. Starting anyway.`
+          );
+        }
+      });
+      const st = getRuntimeState(svc.id);
+      if (!st.process) {
+        try {
+          await startProject(svc.id);
+        } catch (err) {
+          problems.push(`${svc.name}: ${err.message}`);
+          return 'failed';
+        }
+      }
+      const result = await waitForServiceReady(svc, isCancelled);
+      if (result === 'failed' && !isCancelled()) {
+        const reason = getRuntimeState(svc.id).crashReason;
+        problems.push(`${svc.name} stopped while starting${reason ? `: ${reason}` : '.'}`);
+      }
+      broadcastStackStatus(stack.id);
+      return result;
+    })();
+    outcome.set(svc.id, promise);
+    return promise;
+  };
+
+  await Promise.all(ordered.map((svc) => startOne(svc)));
+  const result = serializeStack(stack);
+  return { ...result, ok: problems.length === 0, problems, cancelled: isCancelled() };
+}
+
+async function stopStack(stackId) {
+  const stack = findStackOrThrow(stackId);
+  const rt = getStackRuntime(stackId);
+  rt.runToken += 1; // cancels a start in progress: nothing new is started after this
+  const services = getStackServices(stackId);
+  let ordered = services;
+  try {
+    ordered = orderStackServices(services);
+  } catch {
+    // stop in saved order
+  }
+  // Frontends and workers first, databases last.
+  for (const svc of [...ordered].reverse()) {
+    await stopProject(svc.id).catch(() => null);
+  }
+  if (rt.startPromise) await rt.startPromise.catch(() => null);
+  broadcastStackStatus(stackId);
+  return serializeStack(stack);
+}
+
+async function restartStack(stackId) {
+  await stopStack(stackId);
+  await waitMs(250);
+  return startStack(stackId);
+}
+
+// ------------------------------ stack records ------------------------------
+
+function cleanServiceKind(value) {
+  return SERVICE_KINDS.has(value) ? value : 'server';
+}
+
+/**
+ * Creates a stack and its services in one step.
+ * body: { name, path?, hostname?, services: [{ name, path, command, kind, customPort, hostname, startAfter: [names or ids] }] }
+ */
+function createStackRecord(body = {}) {
+  const name = String(body.name || '').trim();
+  if (!name) {
+    const err = new Error('Give the stack a name.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const rawServices = Array.isArray(body.services) ? body.services : [];
+  if (rawServices.length > 20) {
+    const err = new Error('A stack can hold at most 20 services.');
+    err.statusCode = 400;
+    throw err;
+  }
+  let rootPath = '';
+  if (body.path) {
+    const cleaned = cleanPathInput(body.path);
+    if (cleaned && fs.existsSync(cleaned) && fs.statSync(cleaned).isDirectory()) {
+      rootPath = path.resolve(cleaned);
+    }
+  }
+  const stack = {
+    id: crypto.randomUUID(),
+    name,
+    path: rootPath,
+    hostname: body.hostname
+      ? claimHostname(body.hostname, { stackId: null })
+      : uniqueHostname(namedUrls.slugifyHostname(name), {}),
+    primaryServiceId: null,
+    createdAt: new Date().toISOString()
+  };
+
+  // Validate every service before saving anything.
+  const projectsBefore = projects;
+  const stacksBefore = stacks;
+  stacks = [...stacks, stack];
+  projects = [...projects];
+  const created = [];
+  try {
+    for (const raw of rawServices) {
+      created.push(createProjectRecord({ ...raw, stackId: stack.id, _deferSave: true }));
+    }
+    // startAfter may name other services of this request by name, or by index.
+    const lookup = (ref) => {
+      if (typeof ref === 'number') return created[ref] || null;
+      const key = String(ref || '').trim().toLowerCase();
+      return created.find((c) => c.id === ref || c.name.toLowerCase() === key) || null;
+    };
+    rawServices.forEach((raw, i) => {
+      const refs = Array.isArray(raw && raw.startAfter) ? raw.startAfter : [];
+      created[i].startAfter = Array.from(
+        new Set(refs.map(lookup).filter((c) => c && c.id !== created[i].id).map((c) => c.id))
+      );
+    });
+    orderStackServices(created); // reject loops
+    const primaryRef = body.primaryService;
+    if (primaryRef !== undefined && primaryRef !== null && primaryRef !== '') {
+      const primary = lookup(primaryRef);
+      if (primary) stack.primaryServiceId = primary.id;
+    }
+  } catch (err) {
+    projects = projectsBefore;
+    stacks = stacksBefore;
+    throw err;
+  }
+  for (const c of created) getRuntimeState(c.id);
+  saveProjects();
+  saveStacks();
+  for (const c of created) broadcastProjectStatus(c);
+  broadcastStackStatus(stack.id);
+  return stack;
+}
+
+function updateStackRecord(stackId, body = {}) {
+  const stack = findStackOrThrow(stackId);
+  if (body.name !== undefined) {
+    const n = String(body.name).trim();
+    if (!n) {
+      const err = new Error('Give the stack a name.');
+      err.statusCode = 400;
+      throw err;
+    }
+    stack.name = n;
+  }
+  if (body.hostname !== undefined && body.hostname !== stack.hostname) {
+    const next = claimHostname(body.hostname, { stackId });
+    const old = stack.hostname;
+    stack.hostname = next;
+    // Services that still use the default "<service>.<old>" pattern follow the rename.
+    for (const svc of getStackServices(stackId)) {
+      if (old && svc.hostname && svc.hostname.endsWith(`.${old}`)) {
+        const base = `${svc.hostname.slice(0, -old.length - 1)}.${next}`;
+        svc.hostname = uniqueHostname(base, { projectId: svc.id });
+      }
+    }
+    saveProjects();
+  }
+  if (body.primaryServiceId !== undefined) {
+    if (body.primaryServiceId === null || body.primaryServiceId === '') {
+      stack.primaryServiceId = null;
+    } else {
+      const svc = getStackServices(stackId).find((s) => s.id === body.primaryServiceId);
+      if (!svc) {
+        const err = new Error('That service is not part of this stack.');
+        err.statusCode = 400;
+        throw err;
+      }
+      stack.primaryServiceId = svc.id;
+    }
+  }
+  if (body.serviceOrder !== undefined && Array.isArray(body.serviceOrder)) {
+    // Reorders the services inside the saved project list (start-after rules still win).
+    const ids = body.serviceOrder.filter((id) => projects.some((p) => p.id === id && p.stackId === stackId));
+    const inStack = projects.filter((p) => p.stackId === stackId);
+    const rest = inStack.filter((p) => !ids.includes(p.id));
+    const sorted = [...ids.map((id) => projects.find((p) => p.id === id)), ...rest];
+    let k = 0;
+    projects = projects.map((p) => (p.stackId === stackId ? sorted[k++] : p));
+    saveProjects();
+  }
+  saveStacks();
+  broadcastStackStatus(stackId);
+  for (const svc of getStackServices(stackId)) broadcastProjectStatus(svc);
+  return serializeStack(stack);
+}
+
+/** Deletes a stack. keepServices=true turns its services into stand-alone projects. */
+async function deleteStackRecord(stackId, { keepServices = false } = {}) {
+  const stack = findStackOrThrow(stackId);
+  await stopStack(stackId);
+  const services = getStackServices(stackId);
+  if (keepServices) {
+    for (const svc of services) {
+      delete svc.stackId;
+      delete svc.startAfter;
+      svc.hostname = uniqueHostname(namedUrls.slugifyHostname(svc.name), { projectId: svc.id });
+    }
+  } else {
+    for (const svc of services) {
+      await removeProjectRecord(svc.id);
+    }
+  }
+  stacks = stacks.filter((s) => s.id !== stackId);
+  stackRuntime.delete(stackId);
+  envStore.remove(stackId);
+  saveStacks();
+  saveProjects();
+  if (keepServices) for (const svc of services) broadcastProjectStatus(svc);
+  broadcastEvent('stack-deleted', { id: stack.id, keptServices: keepServices });
+  return { ok: true, id: stack.id };
+}
+
+/** Removes one project (or service) and everything Portly kept for it. */
+async function removeProjectRecord(id) {
+  const project = findProjectOrThrow(id);
+  const state = getRuntimeState(id);
+  if (state.process || state.startPromise || state.stopPromise) {
+    await stopProject(id);
+  }
+  projects = projects.filter((p) => p.id !== id);
+  for (const p of projects) {
+    if (Array.isArray(p.startAfter) && p.startAfter.includes(id)) {
+      p.startAfter = p.startAfter.filter((x) => x !== id);
+    }
+  }
+  for (const s of stacks) {
+    if (s.primaryServiceId === id) s.primaryServiceId = null;
+  }
+  runtimeState.delete(id);
+  pendingLogBroadcasts.delete(id);
+  await closeLogWriter(id);
+  envStore.remove(id);
+  saveProjects();
+  if (project.stackId) saveStacks();
+  broadcastEvent('project-deleted', { id });
+  if (project.stackId) broadcastStackStatus(project.stackId);
+  return project;
+}
+
+/** Applies stack-related fields from a project edit (kind, startAfter, hostname, stackId). */
+function applyServiceFields(project, body) {
+  if (body.stackId !== undefined) {
+    const next = body.stackId ? findStackOrThrow(body.stackId).id : null;
+    if (next !== (project.stackId || null)) {
+      const prevStack = project.stackId;
+      if (next) project.stackId = next;
+      else delete project.stackId;
+      project.startAfter = [];
+      for (const p of projects) {
+        if (p.id !== project.id && Array.isArray(p.startAfter) && p.startAfter.includes(project.id)) {
+          p.startAfter = p.startAfter.filter((x) => x !== project.id);
+        }
+      }
+      for (const s of stacks) {
+        if (s.id === prevStack && s.primaryServiceId === project.id) s.primaryServiceId = null;
+      }
+      if (body.hostname === undefined) project.hostname = '';
+      if (!project.stackId) delete project.startAfter;
+      if (prevStack) broadcastStackStatus(prevStack);
+    }
+  }
+  if (body.kind !== undefined) {
+    project.kind = cleanServiceKind(body.kind);
+  }
+  if (body.startAfter !== undefined) {
+    if (!project.stackId) {
+      const err = new Error('"Start after" only applies to services in a stack.');
+      err.statusCode = 400;
+      throw err;
+    }
+    const siblings = getStackServices(project.stackId);
+    const ids = (Array.isArray(body.startAfter) ? body.startAfter : []).filter(
+      (id) => id !== project.id && siblings.some((s) => s.id === id)
+    );
+    const before = project.startAfter;
+    project.startAfter = Array.from(new Set(ids));
+    try {
+      orderStackServices(siblings);
+    } catch (err) {
+      project.startAfter = before;
+      throw err;
+    }
+  }
+  if (body.hostname !== undefined && String(body.hostname).trim()) {
+    project.hostname = claimHostname(body.hostname, { projectId: project.id });
+  }
+  if (!project.hostname) {
+    project.hostname = defaultHostnameFor(project);
+  }
+}
+
+/** Suggests a stack's services from one folder (does not save anything). */
+function suggestStackFromPath(rawPath) {
+  const cleaned = cleanPathInput(rawPath);
+  if (!cleaned) {
+    const err = new Error('Choose the stack\'s main folder first.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const resolved = path.resolve(cleaned);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    const err = new Error('That folder doesn\'t exist, or Portly can\'t read it.');
+    err.statusCode = 400;
+    throw err;
+  }
+  const suggestion = stackDetect.suggestStack(resolved, {
+    inspect: inspectProjectPath,
+    isProjectDir: isSupportedProjectDir
+  });
+  return suggestion;
 }
 
 function parseLogLine(line) {
@@ -2343,26 +3859,57 @@ function parseLogLine(line) {
   };
 }
 
-function readProjectLogs(id) {
+/** Reads only the last `maxLines` lines of a file, working backwards in 64 KB chunks. */
+async function readTailLines(filePath, maxLines) {
+  const handle = await fs.promises.open(filePath, 'r');
+  try {
+    const { size } = await handle.stat();
+    const chunkSize = 64 * 1024;
+    let position = size;
+    let text = '';
+    let lineCount = 0;
+    while (position > 0 && lineCount <= maxLines) {
+      const readSize = Math.min(chunkSize, position);
+      position -= readSize;
+      const buf = Buffer.alloc(readSize);
+      await handle.read(buf, 0, readSize, position);
+      text = buf.toString('utf8') + text;
+      lineCount = (text.match(/\n/g) || []).length;
+      if (text.length > 4 * 1024 * 1024) break;
+    }
+    let lines = text.split(/\r?\n/);
+    // The first line may be cut in the middle when we didn't read from the start.
+    if (position > 0) lines = lines.slice(1);
+    return { lines: lines.filter((l) => l.length > 0).slice(-maxLines), size };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readProjectLogs(id) {
   findProjectOrThrow(id);
   const logFilePath = getLogFilePath(id);
+  const state = getRuntimeState(id);
   let fileSize = 0;
 
-  if (fs.existsSync(logFilePath)) {
-    try {
-      const stat = fs.statSync(logFilePath);
-      fileSize = stat.size;
-      const content = fs.readFileSync(logFilePath, 'utf8');
-      const rawLines = content.split(/\r?\n/).filter((l) => l.length > 0);
-      const tailLines = rawLines.slice(-MAX_READ_LOG_LINES);
-      const parsed = tailLines.map(parseLogLine);
-      return { logs: parsed, logFilePath, fileSize };
-    } catch (err) {
+  try {
+    const { lines, size } = await readTailLines(logFilePath, MAX_READ_LOG_LINES);
+    fileSize = size;
+    const parsed = lines.map(parseLogLine);
+    // Lines still queued in the write stream are not on disk yet; add them from memory.
+    const writer = logWriters.get(id);
+    if (writer && writer.stream.writableLength > 0 && state.logs.length > 0) {
+      const lastTs = parsed.length ? parsed[parsed.length - 1].timestamp : null;
+      const extra = lastTs ? state.logs.filter((e) => e.timestamp > lastTs) : state.logs;
+      parsed.push(...extra);
+    }
+    return { logs: parsed.slice(-MAX_READ_LOG_LINES), logFilePath, fileSize };
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
       console.error(`Failed reading logs for ${id}:`, err.message);
     }
   }
 
-  const state = getRuntimeState(id);
   return {
     logs: state.logs.slice(-MAX_READ_LOG_LINES),
     logFilePath,
@@ -2370,12 +3917,16 @@ function readProjectLogs(id) {
   };
 }
 
-function clearProjectLogs(id) {
+async function clearProjectLogs(id) {
   findProjectOrThrow(id);
   const state = getRuntimeState(id);
   state.logs = [];
+  state.hasLog = false;
+  pendingLogBroadcasts.delete(id);
+  await closeLogWriter(id);
   const logFilePath = getLogFilePath(id);
   fs.writeFileSync(logFilePath, '', 'utf8');
+  fs.rmSync(getRotatedLogFilePath(id), { force: true });
   return { ok: true, logFilePath };
 }
 
@@ -2522,7 +4073,18 @@ function buildEnvironmentConfig(clientLayout = null) {
       techStack: Array.isArray(p.techStack) ? p.techStack : [],
       defaultPort: p.defaultPort || 3000,
       recommendedCommand: p.recommendedCommand || p.command,
-      deployNote: p.deployNote || ''
+      deployNote: p.deployNote || '',
+      hostname: p.hostname || '',
+      ...(p.kind ? { kind: p.kind } : {}),
+      ...(p.stackId ? { stackId: p.stackId, startAfter: Array.isArray(p.startAfter) ? p.startAfter : [] } : {})
+    })),
+    // Environment variable values are never exported: they often hold secrets.
+    stacks: stacks.map((s) => ({
+      id: s.id,
+      name: s.name,
+      path: s.path || '',
+      hostname: s.hostname || '',
+      primaryServiceId: s.primaryServiceId || null
     }))
   };
 
@@ -2532,6 +4094,107 @@ function buildEnvironmentConfig(clientLayout = null) {
     config: configObj,
     generatedAt
   };
+}
+
+/**
+ * The existing project an imported item updates, if any: the same id, else the same
+ * folder (stand-alone projects) or the same folder and command in the same stack.
+ */
+function findImportMatch(itemObj, resolvedPath, command, mapStackId) {
+  if (typeof itemObj.id === 'string') {
+    const byId = projects.find((p) => p.id === itemObj.id);
+    if (byId && normalizePathKey(byId.path) === normalizePathKey(resolvedPath)) return byId;
+  }
+  const stackId = itemObj.stackId ? mapStackId(itemObj.stackId) : null;
+  return (
+    findDuplicateProject(resolvedPath, {
+      stackId: stackId || null,
+      command: command || itemObj.command || null
+    }) || null
+  );
+}
+
+/** Creates or updates the stacks listed in a config file. Returns oldId -> newId. */
+function importStacks(rawStacks, mode) {
+  const map = new Map();
+  if (!Array.isArray(rawStacks)) return map;
+  for (const raw of rawStacks) {
+    if (!raw || typeof raw !== 'object' || typeof raw.name !== 'string' || !raw.name.trim()) continue;
+    const oldId = typeof raw.id === 'string' ? raw.id : null;
+    let stack = mode === 'merge' && oldId ? stacks.find((s) => s.id === oldId) : null;
+    if (stack) {
+      stack.name = raw.name.trim();
+    } else {
+      stack = {
+        id: oldId && UUID_REGEX.test(oldId) && !stacks.some((s) => s.id === oldId) ? oldId : crypto.randomUUID(),
+        name: raw.name.trim(),
+        path: '',
+        hostname: '',
+        primaryServiceId: null,
+        createdAt: new Date().toISOString()
+      };
+      stacks.push(stack);
+    }
+    const cleanedRoot = cleanPathInput(raw.path);
+    if (cleanedRoot && fs.existsSync(cleanedRoot)) stack.path = path.resolve(cleanedRoot);
+    let wanted = '';
+    try {
+      wanted = raw.hostname ? namedUrls.normalizeHostnameInput(raw.hostname) : '';
+    } catch {
+      wanted = '';
+    }
+    if (!stack.hostname || (wanted && wanted !== stack.hostname)) {
+      stack.hostname = wanted && !isHostnameTaken(wanted, { stackId: stack.id })
+        ? wanted
+        : uniqueHostname(namedUrls.slugifyHostname(stack.name), { stackId: stack.id });
+    }
+    stack._importPrimary = raw.primaryServiceId || null;
+    if (oldId) map.set(oldId, stack.id);
+  }
+  return map;
+}
+
+/**
+ * Lists what an import would do to start commands, without changing anything.
+ * Returns { mode, replacesProjects, commandChanges: [{ name, path, from, to, isNew }] }.
+ */
+function reviewConfigImport(src, rawPayload = {}) {
+  const result = { mode: 'replace', replacesProjects: 0, commandChanges: [] };
+  if (!src || (!Array.isArray(src.projects) && !Array.isArray(src.paths))) {
+    return result;
+  }
+  const rawItems = Array.isArray(src.projects)
+    ? src.projects
+    : src.paths.map((p) => (typeof p === 'string' ? { path: p } : p));
+  const mode = rawPayload.mode === 'merge' || src.mode === 'merge' ? 'merge' : 'replace';
+  result.mode = mode;
+  if (mode === 'replace') {
+    result.replacesProjects = projects.length;
+  }
+
+  for (const item of rawItems) {
+    const itemObj = item && typeof item === 'object' ? item : {};
+    const cleaned = cleanPathInput(typeof item === 'string' ? item : itemObj.path);
+    if (!cleaned) continue;
+    const command = itemObj.command ? String(itemObj.command).trim() : '';
+    if (!command) continue;
+    const resolvedPath = path.resolve(cleaned);
+    if (!fs.existsSync(resolvedPath)) continue;
+    const existing =
+      mode === 'merge' || projects.length > 0
+        ? findImportMatch(itemObj, resolvedPath, command, (id) => id)
+        : null;
+    if (existing && existing.command === command) continue;
+    const name = (itemObj.name && String(itemObj.name).trim()) || path.basename(resolvedPath);
+    result.commandChanges.push({
+      name,
+      path: resolvedPath,
+      from: existing ? existing.command : null,
+      to: command,
+      isNew: !existing
+    });
+  }
+  return result;
 }
 
 async function applyEnvironmentConfig(rawPayload = {}) {
@@ -2553,6 +4216,28 @@ async function applyEnvironmentConfig(rawPayload = {}) {
   if (!hasValidSection) {
     const err = new Error('Invalid Portly config file.');
     err.statusCode = 400;
+    throw err;
+  }
+
+  // Config files are meant to be shared between machines, so treat them as untrusted:
+  // any command they would add or change must be confirmed by the user before it is saved.
+  const review = reviewConfigImport(src, rawPayload);
+  if (
+    (review.commandChanges.length > 0 || review.replacesProjects > 0) &&
+    rawPayload.confirmCommands !== true
+  ) {
+    const err = new Error(
+      review.commandChanges.length > 0
+        ? 'This config adds or changes start commands. Review them before importing.'
+        : 'This config replaces your current project list. Confirm before importing.'
+    );
+    err.statusCode = 409;
+    err.details = {
+      needsConfirmation: true,
+      commandChanges: review.commandChanges,
+      replacesProjects: review.replacesProjects,
+      mode: review.mode
+    };
     throw err;
   }
 
@@ -2627,7 +4312,13 @@ async function applyEnvironmentConfig(rawPayload = {}) {
       await stopAllProjects();
       projects = [];
       runtimeState.clear();
+      stacks = [];
+      stackRuntime.clear();
     }
+    const stackIdMap = importStacks(src.stacks, mode);
+    const mapStackId = (oldId) => stackIdMap.get(oldId) || null;
+    const projectIdMap = new Map(); // id in the file -> id here
+    const importedItems = []; // [record, itemObj]
 
     for (const item of rawItems) {
       const rawPath = typeof item === 'string' ? item : item && item.path;
@@ -2660,8 +4351,8 @@ async function applyEnvironmentConfig(rawPayload = {}) {
         });
         continue;
       }
-      const normalizedKey = normalizePathKey(resolvedPath);
-      const existing = projects.find((p) => normalizePathKey(p.path) === normalizedKey);
+      const importCommand = itemObj.command ? String(itemObj.command).trim() : '';
+      const existing = findImportMatch(itemObj, resolvedPath, importCommand, mapStackId);
       const inspection = inspectProjectPath(resolvedPath);
 
       if (existing) {
@@ -2677,6 +4368,8 @@ async function applyEnvironmentConfig(rawPayload = {}) {
         if (inspection.valid) {
           applyInspectionToProject(existing, inspection, false);
         }
+        if (typeof itemObj.id === 'string') projectIdMap.set(itemObj.id, existing.id);
+        importedItems.push([existing, itemObj]);
         importedProjectsCount += 1;
         continue;
       }
@@ -2685,9 +4378,10 @@ async function applyEnvironmentConfig(rawPayload = {}) {
 
       const fallbackName = path.basename(resolvedPath) || 'project';
       const record = {
+        // Config files can come from other machines, so only keep an id that is a plain UUID.
         id:
-          itemObj.id &&
           typeof itemObj.id === 'string' &&
+          UUID_REGEX.test(itemObj.id) &&
           !projects.some((p) => p.id === itemObj.id)
             ? itemObj.id
             : crypto.randomUUID(),
@@ -2724,18 +4418,64 @@ async function applyEnvironmentConfig(rawPayload = {}) {
 
       projects.push(record);
       getRuntimeState(record.id);
+      if (typeof itemObj.id === 'string') projectIdMap.set(itemObj.id, record.id);
+      importedItems.push([record, itemObj]);
       importedProjectsCount += 1;
     }
 
+    // Stack membership, start order, kind and web address, now that every id is known.
+    for (const [record, itemObj] of importedItems) {
+      const mapped = itemObj.stackId ? mapStackId(itemObj.stackId) : null;
+      if (mapped) {
+        record.stackId = mapped;
+        record.startAfter = (Array.isArray(itemObj.startAfter) ? itemObj.startAfter : [])
+          .map((id) => projectIdMap.get(id))
+          .filter((id) => id && id !== record.id);
+      } else if (itemObj.stackId === undefined && !record.stackId) {
+        delete record.startAfter;
+      }
+      if (itemObj.kind !== undefined) record.kind = cleanServiceKind(itemObj.kind);
+      let wanted = '';
+      try {
+        wanted = itemObj.hostname ? namedUrls.normalizeHostnameInput(itemObj.hostname) : '';
+      } catch {
+        wanted = '';
+      }
+      if (wanted && wanted !== record.hostname && !isHostnameTaken(wanted, { projectId: record.id })) {
+        record.hostname = wanted;
+      } else if (!record.hostname) {
+        record.hostname = defaultHostnameFor(record);
+      }
+    }
+    for (const s of stacks) {
+      if (s._importPrimary !== undefined) {
+        const mappedPrimary = s._importPrimary ? projectIdMap.get(s._importPrimary) : null;
+        if (mappedPrimary) s.primaryServiceId = mappedPrimary;
+        delete s._importPrimary;
+      }
+      // A start-after loop from a hand-edited file would block the stack: drop the rules.
+      try {
+        orderStackServices(getStackServices(s.id));
+      } catch {
+        for (const svc of getStackServices(s.id)) svc.startAfter = [];
+      }
+    }
+    // Stacks from the file whose services were all missing are dropped.
+    const importedStackIds = new Set(stackIdMap.values());
+    stacks = stacks.filter((s) => !importedStackIds.has(s.id) || getStackServices(s.id).length > 0);
+    repairStacksAndHostnames();
     saveProjects();
+    saveStacks();
   }
 
   const serializedProjects = projects.map(serializeProject);
+  const serializedStacks = listStacksSerialized();
   broadcastEvent('settings-updated', settings);
   broadcastEvent('config-imported', {
     settings,
     layout: savedLayout,
     projects: serializedProjects,
+    stacks: serializedStacks,
     brokenProjects
   });
 
@@ -2744,6 +4484,7 @@ async function applyEnvironmentConfig(rawPayload = {}) {
     settings,
     layout: savedLayout,
     projects: serializedProjects,
+    stacks: serializedStacks,
     importedProjectsCount,
     skippedMissingPaths,
     brokenProjects
@@ -2991,11 +4732,28 @@ function serveStaticFile(res, pathname) {
 
   const ext = path.extname(resolved).toLowerCase();
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-  res.writeHead(200, {
+  const headers = {
     'Content-Type': contentType,
-    'Cache-Control': 'no-cache'
+    'Cache-Control': 'no-cache',
+    'X-Content-Type-Options': 'nosniff'
+  };
+  if (ext === '.html') {
+    // The UI can add and start commands, so lock it down: no inline or third-party scripts.
+    headers['Content-Security-Policy'] =
+      "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
+  }
+  const stream = fs.createReadStream(resolved);
+  stream.on('error', (err) => {
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: `Could not read ${relativePath}: ${err.code || err.message}` });
+    } else {
+      res.destroy();
+    }
   });
-  fs.createReadStream(resolved).pipe(res);
+  stream.once('open', () => {
+    res.writeHead(200, headers);
+    stream.pipe(res);
+  });
 }
 
 async function handleApi(req, res, pathname) {
@@ -3031,6 +4789,11 @@ async function handleApi(req, res, pathname) {
     return;
   }
 
+  if (method === 'GET' && pathname === '/api/notices') {
+    sendJson(res, 200, { notices: startupNotices });
+    return;
+  }
+
   if (method === 'GET' && pathname === '/api/system') {
     sendJson(res, 200, getSystemInfo());
     return;
@@ -3056,10 +4819,16 @@ async function handleApi(req, res, pathname) {
         body.exitClosesCompletely !== undefined
           ? body.exitClosesCompletely
           : settings.exitClosesCompletely,
-      onboarded: body.onboarded !== undefined ? body.onboarded : settings.onboarded
+      onboarded: body.onboarded !== undefined ? body.onboarded : settings.onboarded,
+      namedUrls: body.namedUrls !== undefined ? body.namedUrls : settings.namedUrls,
+      proxyPort: body.proxyPort !== undefined ? validateProxyPortInput(body.proxyPort) : settings.proxyPort
     });
     broadcastEvent('settings-updated', updated);
-    sendJson(res, 200, updated);
+    let namedUrlResult = null;
+    if (body.namedUrls !== undefined || body.proxyPort !== undefined) {
+      namedUrlResult = await syncNamedUrlProxy();
+    }
+    sendJson(res, 200, namedUrlResult ? { ...updated, namedUrlStatus: getNamedUrlStatus() } : updated);
     return;
   }
 
@@ -3355,6 +5124,105 @@ async function handleApi(req, res, pathname) {
     return;
   }
 
+  // ---------------- stacks ----------------
+  if (method === 'GET' && pathname === '/api/stacks') {
+    sendJson(res, 200, listStacksSerialized());
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/api/stacks/suggest') {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, suggestStackFromPath(body.path));
+    return;
+  }
+
+  if (method === 'POST' && pathname === '/api/stacks') {
+    const body = await readJsonBody(req);
+    const stack = createStackRecord(body);
+    sendJson(res, 201, {
+      stack: serializeStack(stack),
+      services: getStackServices(stack.id).map(serializeProject)
+    });
+    return;
+  }
+
+  const stackActionMatch = pathname.match(/^\/api\/stacks\/([^/]+)(?:\/(start|stop|restart))?$/);
+  if (stackActionMatch) {
+    const stackId = decodeURIComponent(stackActionMatch[1]);
+    const action = stackActionMatch[2] || '';
+    if (!action && method === 'GET') {
+      sendJson(res, 200, serializeStack(findStackOrThrow(stackId)));
+      return;
+    }
+    if (!action && method === 'PUT') {
+      const body = await readJsonBody(req);
+      sendJson(res, 200, updateStackRecord(stackId, body));
+      return;
+    }
+    if (!action && method === 'DELETE') {
+      const keepServices = new URL(req.url || '/', 'http://127.0.0.1').searchParams.get('keepServices') === '1';
+      sendJson(res, 200, await deleteStackRecord(stackId, { keepServices }));
+      return;
+    }
+    if (action === 'start' && method === 'POST') {
+      sendJson(res, 200, await startStack(stackId));
+      return;
+    }
+    if (action === 'stop' && method === 'POST') {
+      sendJson(res, 200, await stopStack(stackId));
+      return;
+    }
+    if (action === 'restart' && method === 'POST') {
+      sendJson(res, 200, await restartStack(stackId));
+      return;
+    }
+  }
+
+  // ---------------- environment variables ----------------
+  const envMatch = pathname.match(/^\/api\/env\/([^/]+)(?:\/(import-file|profile))?$/);
+  if (envMatch) {
+    const ownerId = decodeURIComponent(envMatch[1]);
+    const action = envMatch[2] || '';
+    if (!action && method === 'GET') {
+      sendJson(res, 200, describeEnv(ownerId));
+      return;
+    }
+    if (!action && method === 'PUT') {
+      getEnvOwner(ownerId);
+      const body = await readJsonBody(req);
+      envStore.set(ownerId, body);
+      afterEnvChange(ownerId);
+      sendJson(res, 200, describeEnv(ownerId));
+      return;
+    }
+    if (action === 'profile' && method === 'POST') {
+      getEnvOwner(ownerId);
+      const body = await readJsonBody(req);
+      envStore.setActiveProfile(ownerId, String(body.profile || ''));
+      afterEnvChange(ownerId);
+      sendJson(res, 200, describeEnv(ownerId));
+      return;
+    }
+    if (action === 'import-file' && method === 'POST') {
+      // Reads one of the known .env files from the project's folder. Nothing is saved:
+      // the UI shows the rows so the user can review them before saving.
+      const { dir } = getEnvOwner(ownerId);
+      const body = await readJsonBody(req);
+      if (!dir) {
+        sendJson(res, 400, { error: 'This stack has no main folder to read .env files from.' });
+        return;
+      }
+      sendJson(res, 200, { file: String(body.file || ''), vars: envStoreLib.readEnvFile(dir, String(body.file || '')) });
+      return;
+    }
+  }
+
+  // ---------------- named URLs ----------------
+  if (method === 'GET' && pathname === '/api/named-urls') {
+    sendJson(res, 200, getNamedUrlStatus());
+    return;
+  }
+
   const projectActionMatch = pathname.match(
     /^\/api\/projects\/([^/]+)(?:\/(start|stop|restart|reanalyze|logs|open-folder))?$/
   );
@@ -3375,10 +5243,11 @@ async function handleApi(req, res, pathname) {
           sendJson(res, 400, { error: inspection.error });
           return;
         }
-        const key = normalizePathKey(inspection.resolvedPath);
-        const dup = projects.find(
-          (p) => p.id !== id && normalizePathKey(p.path) === key
-        );
+        const dup = findDuplicateProject(inspection.resolvedPath, {
+          stackId: project.stackId || null,
+          command: body.command !== undefined ? String(body.command).trim() : project.command,
+          excludeId: id
+        });
         if (dup) {
           sendJson(res, 409, { error: `Another project already uses ${dup.path}` });
           return;
@@ -3386,6 +5255,16 @@ async function handleApi(req, res, pathname) {
         nextPath = inspection.resolvedPath;
       } else {
         inspection = inspectProjectPath(project.path);
+      }
+
+      // Check the stack fields first, so a bad value changes nothing.
+      const before = JSON.stringify(project);
+      try {
+        applyServiceFields(project, body);
+      } catch (err) {
+        Object.keys(project).forEach((k) => delete project[k]);
+        Object.assign(project, JSON.parse(before));
+        throw err;
       }
 
       project.path = nextPath;
@@ -3403,21 +5282,14 @@ async function handleApi(req, res, pathname) {
       }
 
       saveProjects();
+      saveStacks();
       broadcastProjectStatus(project);
       sendJson(res, 200, serializeProject(project));
       return;
     }
 
     if (!action && method === 'DELETE') {
-      findProjectOrThrow(id);
-      const state = getRuntimeState(id);
-      if (state.status === 'running' && state.pid) {
-        await stopProject(id);
-      }
-      projects = projects.filter((p) => p.id !== id);
-      runtimeState.delete(id);
-      saveProjects();
-      broadcastEvent('project-deleted', { id });
+      await removeProjectRecord(id);
       sendJson(res, 200, { ok: true, id });
       return;
     }
@@ -3455,13 +5327,13 @@ async function handleApi(req, res, pathname) {
     }
 
     if (action === 'logs' && method === 'GET') {
-      const result = readProjectLogs(id);
+      const result = await readProjectLogs(id);
       sendJson(res, 200, result);
       return;
     }
 
     if (action === 'logs' && method === 'DELETE') {
-      const result = clearProjectLogs(id);
+      const result = await clearProjectLogs(id);
       sendJson(res, 200, result);
       return;
     }
@@ -3482,36 +5354,59 @@ async function handleApi(req, res, pathname) {
 }
 
 function cleanupAllRunningChildrenSync() {
+  const pids = [];
   for (const [, state] of runtimeState.entries()) {
     clearProbeTimer(state);
-    if (state.pid) {
-      if (process.platform === 'win32') {
-        try {
-          execFileSync('taskkill', ['/PID', String(state.pid), '/T', '/F'], {
-            windowsHide: true,
-            stdio: 'ignore'
-          });
-        } catch {
-          // Ignore errors if child already exited
-        }
-      } else {
-        try {
-          process.kill(-state.pid, 'SIGKILL');
-        } catch {
-          try {
-            process.kill(state.pid, 'SIGKILL');
-          } catch {
-            // Ignore errors if child already exited
-          }
-        }
+    if (state.pid) pids.push(state.pid);
+  }
+  if (pids.length === 0) return;
+
+  if (process.platform === 'win32') {
+    // One taskkill call for every tree instead of one blocking call per project.
+    const args = [];
+    for (const pid of pids) args.push('/PID', String(pid));
+    args.push('/T', '/F');
+    try {
+      execFileSync('taskkill', args, { windowsHide: true, stdio: 'ignore', timeout: 15000 });
+    } catch {
+      // Ignore errors if some children already exited
+    }
+    return;
+  }
+
+  for (const pid of pids) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // Ignore errors if child already exited
       }
     }
+  }
+}
+
+/** Last-resort handler: write the error to the crash-reports folder instead of dying silently. */
+function recordInternalError(kind, err) {
+  const text = err && err.stack ? err.stack : String(err);
+  console.error(`Portly ${kind}:`, text);
+  try {
+    ensureDirectories();
+    fs.appendFileSync(
+      path.join(CRASH_REPORTS_DIR, 'portly-internal-errors.log'),
+      `[${new Date().toISOString()}] ${kind}: ${text}\n`,
+      'utf8'
+    );
+  } catch {
+    // nothing else we can do
   }
 }
 
 loadSettings();
 loadLayout();
 loadOrSeedProjects();
+loadStacks();
 
 /**
  * Blocks cross-site and DNS-rebinding requests to the local API.
@@ -3556,7 +5451,13 @@ function rejectUntrustedRequest(req) {
   return null;
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer(handleHttpRequest);
+// The named URL proxy only makes sense while Portly itself is up.
+server.on('close', () => {
+  namedUrlProxy.stop().catch(() => {});
+});
+
+async function handleHttpRequest(req, res) {
   try {
     const rejection = rejectUntrustedRequest(req);
     if (rejection) {
@@ -3574,11 +5475,23 @@ const server = http.createServer(async (req, res) => {
     serveStaticFile(res, pathname);
   } catch (err) {
     const statusCode = err.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error('Portly API error:', err && err.stack ? err.stack : err);
+    }
     if (!res.headersSent) {
-      sendJson(res, statusCode, { error: err.message || 'Internal Server Error' });
+      sendJson(res, statusCode, {
+        error: err.message || 'Internal Server Error',
+        ...(err.details && typeof err.details === 'object' ? err.details : {})
+      });
+    } else {
+      try {
+        res.end();
+      } catch {
+        // ignore
+      }
     }
   }
-});
+}
 
 let signalsRegistered = false;
 function registerShutdownSignals() {
@@ -3592,10 +5505,25 @@ function registerShutdownSignals() {
     cleanupAllRunningChildrenSync();
     process.exit(0);
   });
+  if (process.platform !== 'win32') {
+    // Closing the terminal that runs `node server.js` sends SIGHUP.
+    process.on('SIGHUP', () => {
+      cleanupAllRunningChildrenSync();
+      process.exit(0);
+    });
+  }
+  // Only take over uncaught errors when Portly is its own process; inside Electron the
+  // main process installs its own handler.
+  if (!process.versions.electron) {
+    process.on('uncaughtException', (err) => recordInternalError('uncaughtException', err));
+  }
+  process.on('unhandledRejection', (err) => recordInternalError('unhandledRejection', err));
 }
 
 function startServer(listenPort = PORT) {
   registerShutdownSignals();
+  // Warm up the login-shell PATH lookup (macOS/Linux) so the first Start doesn't wait on it.
+  loadLoginShellPath();
   return new Promise((resolve, reject) => {
     if (server.listening) {
       const addr = server.address();
@@ -3616,7 +5544,14 @@ function startServer(listenPort = PORT) {
       console.log(`Portly Local App Studio running at http://localhost:${activePort}`);
       console.log(`Platform: ${getSystemInfo().osName} (${process.platform}/${os.arch()})`);
       console.log(`Loaded ${projects.length} project(s) from ${PROJECTS_FILE}`);
-      resolve({ server, port: activePort, url: `http://localhost:${activePort}` });
+      // Named URLs are a convenience: if the proxy can't start, Portly still runs.
+      syncNamedUrlProxy()
+        .then((r) => {
+          if (r && !r.ok && r.error) startupNotices.push({ level: 'warning', message: r.error });
+          else if (r && r.running) console.log(`Named URLs: http://<name>.localhost:${r.port}`);
+        })
+        .catch((err) => recordInternalError('namedUrlProxy', err))
+        .finally(() => resolve({ server, port: activePort, url: `http://localhost:${activePort}` }));
     };
 
     server.once('error', onError);
@@ -3655,5 +5590,21 @@ module.exports = {
   buildCrashReport,
   buildEnvironmentConfig,
   applyEnvironmentConfig,
-  getWindowsModernPickerScript
+  reviewConfigImport,
+  recordInternalError,
+  getWindowsModernPickerScript,
+  startProject,
+  stopProject,
+  startStack,
+  stopStack,
+  restartStack,
+  listStacksSerialized,
+  setSecretCodec,
+  syncNamedUrlProxy,
+  stopNamedUrlProxy: () => namedUrlProxy.stop(),
+  getNamedUrlStatus,
+  composeProjectEnv,
+  onProjectStatus,
+  onSettingsChanged,
+  listProjectsWithStatus
 };

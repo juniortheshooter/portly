@@ -21,8 +21,9 @@
 
   --text-primary: #0f172a;
   --text-secondary: #334155;
-  --text-muted: #64748b;
+  --text-muted: #525c6e;
   --text-log: #0f172a;
+  --focus-ring: #2563eb;
 
   --ink: #111827;
   --ink-text: #ffffff;
@@ -51,7 +52,7 @@
   --note-border: #c7d2fe;
   --note-text: #312e81;
 
-  --switch-off: #cbd5e1;
+  --switch-off: #8792a6;
   --switch-on: #2563eb;
   --shadow-interior: 0 6px 22px -10px rgba(15, 23, 42, 0.08), 0 1px 4px rgba(15, 23, 42, 0.03), inset 0 1px 0 rgba(255, 255, 255, 0.9);
   --shadow-shell: 0 8px 24px -14px rgba(15, 23, 42, 0.07);
@@ -86,8 +87,9 @@
 
   --text-primary: #f3f4f6;
   --text-secondary: #9ca3af;
-  --text-muted: #6b7280;
+  --text-muted: #8b93a3;
   --text-log: #e5e7eb;
+  --focus-ring: #93c5fd;
 
   --ink: #f3f4f6;
   --ink-text: #111317;
@@ -116,7 +118,7 @@
   --note-border: rgba(255, 255, 255, 0.1);
   --note-text: #d1d5db;
 
-  --switch-off: #373a43;
+  --switch-off: #6b7586;
   --switch-on: #3b82f6;
   --shadow-shell: 0 10px 28px -14px rgba(0, 0, 0, 0.32);
   --shadow-card: 0 2px 10px -3px rgba(0, 0, 0, 0.2), 0 1px 2px rgba(0, 0, 0, 0.1);
@@ -134,8 +136,14 @@
 }
 
 *::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
+  width: 10px;
+  height: 10px;
+}
+
+/* macOS users expect thin overlay-style scrollbars. */
+[data-os="mac"] *::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
 }
 
 *::-webkit-scrollbar-track {
@@ -3021,5 +3029,318 @@ select:focus {
 
   .logs-pane {
     min-height: 360px;
+  }
+}
+
+
+/* ===================================================================
+   Audit fixes (Nov 2026): accessibility, states, platform fit
+   =================================================================== */
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Visible keyboard focus on every control */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible,
+.ios-switch:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.logs-output:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Switch "off" track meets 3:1 contrast and has an edge on any background */
+.ios-switch {
+  box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.18);
+}
+
+/* Status by shape as well as colour: ● running, ◐ starting, ▲ crashed, ○ stopped */
+.status-dot.stopped {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-muted);
+}
+
+.status-dot.crashed {
+  border-radius: 0;
+  width: 9px;
+  height: 8px;
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+  box-shadow: none;
+}
+
+.status-dot.starting {
+  background: var(--amber);
+  box-shadow: 0 0 0 4px var(--amber-soft);
+  animation: portlyPulse 1.4s ease-in-out infinite;
+}
+
+.status-pill.starting,
+.conn-status-label.starting {
+  color: var(--amber);
+}
+
+.status-pill.starting {
+  background: var(--amber-soft);
+}
+
+@keyframes portlyPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.project-card.phase-starting .app-avatar {
+  animation: portlyPulse 1.4s ease-in-out infinite;
+}
+
+/* Crash reason on the card */
+.crash-reason {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--rose-soft);
+  border: 1px solid var(--rose-border);
+  color: var(--rose-text);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crash-reason-inline {
+  display: inline-block;
+  margin-top: 0;
+  max-width: 260px;
+  vertical-align: middle;
+}
+
+.port-warning {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--amber);
+}
+
+.card-port {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+/* Patched cards must not replay the expand animation on every status change */
+.project-card.no-anim .card-details {
+  animation: none;
+}
+
+.sidebar-empty {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.empty-state-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* Log console: a thin coloured gutter instead of a STDOUT/STDERR badge on every line,
+   and colour by what the line says (errors red, warnings amber), not by stream. */
+.log-line {
+  grid-template-columns: 72px 3px 1fr;
+}
+
+.log-stream {
+  width: 3px;
+  min-height: 1em;
+  padding: 0;
+  border-radius: 2px;
+  align-self: stretch;
+  font-size: 0;
+}
+
+.log-stream.stdout {
+  background: var(--blue-border);
+}
+
+.log-stream.stderr {
+  background: var(--rose-border);
+}
+
+.log-stream.system {
+  background: var(--purple-border);
+}
+
+.log-text.stderr {
+  color: var(--text-log);
+}
+
+.log-line.tone-error .log-text {
+  color: var(--rose);
+}
+
+.log-line.tone-warn .log-text {
+  color: var(--amber);
+}
+
+.log-line.tone-system .log-text {
+  color: var(--purple-text);
+}
+
+/* Toasts: top-right, away from the log console; errors stay until dismissed */
+.toast-container {
+  top: 46px;
+  bottom: auto;
+  max-width: min(440px, calc(100vw - 36px));
+  z-index: 140;
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.toast-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toast-action,
+.toast-close {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--blue-text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.toast-close {
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+/* Confirmation dialog */
+.modal-backdrop.confirm-dialog {
+  z-index: 130;
+}
+
+.confirm-card {
+  max-width: 520px;
+}
+
+.confirm-message {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.confirm-list {
+  margin: 0 0 14px;
+  padding-left: 18px;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.confirm-list code {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-subtle);
+}
+
+.confirm-list .confirm-old {
+  text-decoration: line-through;
+  opacity: 0.75;
+}
+
+.confirm-list .confirm-new {
+  color: var(--rose-text);
+}
+
+.btn-danger {
+  background: #e11d48;
+  color: #ffffff;
+  border-color: #e11d48;
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.05);
+}
+
+/* Window frame per platform (set by the desktop shell via ?titlebar=...) */
+[data-titlebar="overlay"] .window-titlebar-controls,
+[data-titlebar="inset"] .window-titlebar-controls,
+[data-titlebar="native"] .window-titlebar-controls {
+  display: none;
+}
+
+/* Windows draws its own caption buttons on the right of our title bar. */
+[data-titlebar="overlay"] .window-titlebar {
+  padding-right: 150px;
+}
+
+/* macOS traffic lights sit at the top-left of our title bar. */
+[data-titlebar="inset"] .window-titlebar {
+  padding-left: 84px;
+}
+
+/* Linux uses the desktop's own frame, so our bar is only a thin spacer. */
+[data-titlebar="native"] .app-frame {
+  grid-template-rows: 10px minmax(0, 1fr);
+}
+
+[data-titlebar="native"] .window-titlebar {
+  height: 10px;
+  -webkit-app-region: no-drag;
+}
+
+/* Respect "reduce motion" */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .page-transition-overlay,
+  .ambient-blob {
+    display: none !important;
   }
 }

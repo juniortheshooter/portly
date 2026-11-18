@@ -13,6 +13,9 @@
  *   node portly-cli.js logs <project> [--lines 50] [--stream stderr]
  *   node portly-cli.js add <folder> [--name N] [--command "npm run dev"] [--port 3000]
  *   node portly-cli.js stop-all
+ *   node portly-cli.js stacks
+ *   node portly-cli.js start-stack <stack>
+ *   node portly-cli.js stop-stack <stack>
  */
 
 const client = require('./portly-client');
@@ -48,6 +51,9 @@ const USAGE = `Portly CLI (needs the Portly app to be running)
   logs <project> [--lines N] [--stream stdout|stderr|system]
   add <folder> [--name N] [--command C] [--port P]
   stop-all                   Stop every running project
+  stacks                     Show all stacks and their services
+  start-stack <stack>        Start every service of a stack, in order
+  stop-stack <stack>         Stop every service of a stack
 
 <project> is a project name, id or folder path. Set PORTLY_URL to use a different port.`;
 
@@ -100,6 +106,15 @@ async function main() {
       break;
     case 'stop-all':
       print((await client.stopAll()).map(client.summarize));
+      break;
+    case 'stacks':
+      print(await Promise.all((await client.listStacks()).map(client.describeStack)));
+      break;
+    case 'start-stack':
+      print(await client.startStack(arg));
+      break;
+    case 'stop-stack':
+      print(await client.stopStack(arg));
       break;
     default:
       console.log(USAGE);

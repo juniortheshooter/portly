@@ -95,8 +95,60 @@ function summarize(p) {
     command: p.command,
     framework: p.framework || null,
     language: p.language || null,
-    exitCode: p.exitCode === undefined ? null : p.exitCode
+    exitCode: p.exitCode === undefined ? null : p.exitCode,
+    // Stable address such as http://shop.localhost:1355 (null when named URLs are off).
+    namedUrl: p.namedUrl || null,
+    stackId: p.stackId || null,
+    kind: p.kind || 'server'
   };
+}
+
+async function listStacks() {
+  const list = await request('GET', '/api/stacks');
+  return Array.isArray(list) ? list : [];
+}
+
+/** Finds a stack by id, exact name or a unique partial name. */
+async function resolveStack(ref) {
+  const needle = String(ref || '').trim();
+  if (!needle) throw new Error('A stack name or id is required.');
+  const all = await listStacks();
+  const lower = needle.toLowerCase();
+  const exact = all.find((s) => s.id === needle) || all.find((s) => String(s.name).toLowerCase() === lower);
+  if (exact) return exact;
+  const partial = all.filter((s) => String(s.name).toLowerCase().includes(lower));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    throw new Error(`"${needle}" matches several stacks: ${partial.map((s) => s.name).join(', ')}. Use the exact name or id.`);
+  }
+  throw new Error(`No stack matches "${needle}". Known stacks: ${all.map((s) => s.name).join(', ') || '(none yet)'}.`);
+}
+
+/** A stack with its services summarized, in start order. */
+async function describeStack(stack) {
+  const projects = await listProjects();
+  return {
+    id: stack.id,
+    name: stack.name,
+    status: stack.status,
+    url: stack.namedUrl || null,
+    services: stack.serviceIds
+      .map((id) => projects.find((p) => p.id === id))
+      .filter(Boolean)
+      .map(summarize)
+  };
+}
+
+/** Starts every service of a stack in order; resolves when they are up or one fails. */
+async function startStack(ref) {
+  const stack = await resolveStack(ref);
+  const result = await request('POST', `/api/stacks/${encodeURIComponent(stack.id)}/start`);
+  return { ...(await describeStack(result)), ok: result.ok !== false, problems: result.problems || [] };
+}
+
+async function stopStack(ref) {
+  const stack = await resolveStack(ref);
+  return describeStack(await request('POST', `/api/stacks/${encodeURIComponent(stack.id)}/stop`));
 }
 
 async function listProjects() {
@@ -209,5 +261,10 @@ module.exports = {
   addProject,
   inspectPath,
   stopAll,
+  listStacks,
+  resolveStack,
+  describeStack,
+  startStack,
+  stopStack,
   getBaseUrl
 };

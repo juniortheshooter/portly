@@ -161,8 +161,12 @@ function findChromiumAppBinary(platformOverride = process.platform) {
 }
 
 function openDefaultBrowser(targetUrl) {
+  if (!/^https?:\/\//i.test(String(targetUrl))) {
+    throw new Error(`Refusing to open a non-http(s) URL: ${targetUrl}`);
+  }
   if (process.platform === 'win32') {
-    const child = spawn('cmd.exe', ['/d', '/s', '/c', 'start', '""', targetUrl], {
+    // Not `cmd /c start`: cmd would treat & | ^ in the URL as shell syntax.
+    const child = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', targetUrl], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true

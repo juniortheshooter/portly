@@ -34,6 +34,9 @@ Portly runs each project with the tools that are already on your computer. A Nod
 - **Handles port conflicts for you.** When two apps want the same port, Portly picks a free one and passes it to the app.
 - **Live logs.** See stdout and stderr as they happen, filter and search them, and export a crash report with one click.
 - **Runs in the background.** Close the window and your servers keep running from the system tray.
+- **Stacks.** Group a frontend, an API, a worker and a database into one stack. One switch starts them in the right order, each waiting until the one before it is ready, and stops them in reverse. Portly suggests the services from a Procfile, workspaces, a compose file or common folders like `web/` and `api/`.
+- **Environment variables per project.** Keep variables in Portly instead of a `.env` file, switch between profiles like Dev and Test, and import an existing `.env`. Values are encrypted on your computer and are never exported or written to logs. Each service also gets its siblings' ports, for example `PORTLY_API_PORT`.
+- **Named URLs.** Open `http://shop.localhost:1355` instead of remembering port numbers. Portly forwards the name to whatever port the app got today, WebSockets included. You can turn this off or change the port in Settings.
 - **Portable setups.** Save your project list and layout to a `.json` file and load it on another computer.
 - **Private by design.** Everything runs on your computer. There is no telemetry, no account, and no cloud service. The control panel only listens on `127.0.0.1`.
 
@@ -92,7 +95,7 @@ Portly includes an [MCP](https://modelcontextprotocol.io) server, so AI coding a
 
 Once connected, you can say things like "start my shop project and tell me the URL" or "the API crashed, check its logs".
 
-**What the agent can do:** list projects, check status, start, stop, restart, read logs, detect what kind of project a folder is, add a project, and stop everything. It cannot delete projects or change your settings.
+**What the agent can do:** list projects, check status, start, stop, restart, read logs, detect what kind of project a folder is, add a project, list, start and stop stacks, and stop everything. It cannot delete projects or change your settings.
 
 **What you need:**
 1. Portly is running (open the app, or the source edition).
@@ -168,6 +171,9 @@ node portly-cli.js start "my project"
 node portly-cli.js logs "my project" --lines 30
 node portly-cli.js stop "my project"
 node portly-cli.js add /path/to/folder --name "My Project"
+node portly-cli.js stacks
+node portly-cli.js start-stack "shop"
+node portly-cli.js stop-stack "shop"
 ```
 Run `node portly-cli.js help` for the full list.
 

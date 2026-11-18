@@ -2,6 +2,8 @@
 
 const state = {
   projects: [],
+  // Stacks: groups of services that start together (see stacks-ui.js).
+  stacks: [],
   settings: {
     userName: '',
     theme: 'light',
@@ -31,6 +33,8 @@ const state = {
   logSearch: '',
   autoScroll: true,
   sse: null,
+  // True when SSE updates arrived while the window was hidden; render once it's visible again.
+  needsFullRender: false,
   configImportMode: 'replace',
   brokenPathsQueue: [],
   brokenPathsSourceLabel: '',
@@ -201,6 +205,56 @@ let pendingOnboardingTheme = 'light';
 const pendingOpenTabs = new Map();
 
 // Clean inline SVG icon helpers
+// The desktop shell tells the page how the window frame is drawn (see electron-main.js).
+(function applyTitlebarMode() {
+  try {
+    const mode = new URLSearchParams(window.location.search).get('titlebar');
+    if (['overlay', 'inset', 'native'].includes(mode)) {
+      document.documentElement.dataset.titlebar = mode;
+    }
+  } catch {
+    // ignore
+  }
+})();
+
+const systemDarkQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+function normalizeThemeChoice(theme) {
+  return theme === 'dark' || theme === 'system' ? theme : 'light';
+}
+
+function resolveTheme(theme) {
+  if (theme === 'system') {
+    return systemDarkQuery && systemDarkQuery.matches ? 'dark' : 'light';
+  }
+  return theme === 'dark' ? 'dark' : 'light';
+}
+
+function setPressed(buttons, isPressed) {
+  for (const btn of buttons || []) {
+    const pressed = Boolean(isPressed(btn));
+    btn.classList.toggle('active', pressed);
+    btn.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+  }
+}
+
+/** A project is "starting" while it runs but no URL/port has answered yet. */
+function getProjectPhase(p) {
+  // Workers have no port to wait for: once their process is up, they are running.
+  if (p.status === 'running' && !p.detectedUrl && p.kind !== 'worker') return 'starting';
+  return p.status;
+}
+
+const STARTING_SLOW_MS = 20000;
+
+function getStartingText(p) {
+  const port = p.assignedPort || p.customPort || p.defaultPort;
+  if (p.startedAt && Date.now() - p.startedAt > STARTING_SLOW_MS) {
+    return 'No port detected yet. Check the logs.';
+  }
+  return port ? `Starting… waiting for :${port}` : 'Starting…';
+}
+
 function iconSpark() {
   return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3L12 3Z"></path></svg>';
 }
@@ -266,21 +320,148 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-function showToast(message, type = 'success') {
+function showToast(message, type = 'success', options = {}) {
   const el = document.createElement('div');
+  const isError = type === 'error';
   el.className = `toast ${type}`;
-  el.textContent = message;
+  // Errors are announced right away and stay until dismissed.
+  el.setAttribute('role', isError ? 'alert' : 'status');
+
+  const text = document.createElement('span');
+  text.className = 'toast-text';
+  text.textContent = message;
+  el.appendChild(text);
+
+  if (options.actionLabel && typeof options.onAction === 'function') {
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'toast-action';
+    action.textContent = options.actionLabel;
+    action.addEventListener('click', () => {
+      el.remove();
+      options.onAction();
+    });
+    el.appendChild(action);
+  }
+
+  const sticky = isError || options.sticky;
+  if (sticky || options.actionLabel) {
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'toast-close';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.textContent = '×';
+    close.addEventListener('click', () => el.remove());
+    el.appendChild(close);
+  }
+
   els.toastContainer.appendChild(el);
-  setTimeout(() => {
-    el.remove();
-  }, 3600);
+  while (els.toastContainer.children.length > 4) {
+    els.toastContainer.firstElementChild.remove();
+  }
+  if (!sticky) {
+    setTimeout(() => el.remove(), options.duration || 3600);
+  }
+  return el;
+}
+
+// In-app confirmation dialog (replaces window.confirm). Resolves true or false.
+function confirmDialog({ title, message, detailsHtml = '', confirmLabel = 'Confirm', danger = false }) {
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop confirm-dialog';
+    backdrop.setAttribute('role', 'alertdialog');
+    backdrop.setAttribute('aria-modal', 'true');
+    const titleId = `confirm-title-${Date.now()}`;
+    backdrop.setAttribute('aria-labelledby', titleId);
+    backdrop.innerHTML = `
+      <div class="modal-card confirm-card">
+        <div class="modal-header"><h3 id="${titleId}">${escapeHtml(title)}</h3></div>
+        <div class="modal-body">
+          <p class="confirm-message">${escapeHtml(message)}</p>
+          ${detailsHtml}
+          <div class="modal-footer">
+            <button type="button" class="btn btn-soft" data-confirm="cancel">Cancel</button>
+            <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-confirm="ok">${escapeHtml(confirmLabel)}</button>
+          </div>
+        </div>
+      </div>`;
+    const finish = (result) => {
+      backdrop.remove();
+      document.removeEventListener('keydown', onKey, true);
+      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+      resolve(result);
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      } else if (e.key === 'Tab') {
+        e.stopPropagation();
+        trapFocus(backdrop, e);
+      }
+    };
+    backdrop.addEventListener('click', (e) => {
+      if (e.target === backdrop) finish(false);
+      const btn = e.target.closest('[data-confirm]');
+      if (btn) finish(btn.dataset.confirm === 'ok');
+    });
+    document.addEventListener('keydown', onKey, true);
+    document.body.appendChild(backdrop);
+    // For destructive actions, start on Cancel so Enter doesn't delete by accident.
+    backdrop.querySelector(danger ? '[data-confirm="cancel"]' : '[data-confirm="ok"]').focus();
+  });
+}
+
+function getFocusable(container) {
+  return Array.from(
+    container.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )
+  ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+function trapFocus(container, e) {
+  const focusable = getFocusable(container);
+  if (focusable.length === 0) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (e.shiftKey && (document.activeElement === first || !container.contains(document.activeElement))) {
+    e.preventDefault();
+    last.focus();
+  } else if (!e.shiftKey && (document.activeElement === last || !container.contains(document.activeElement))) {
+    e.preventDefault();
+    first.focus();
+  }
+}
+
+// Remember what had focus when a dialog opened, and put it back when the dialog closes.
+const modalReturnFocus = new Map();
+function rememberFocusFor(modalEl) {
+  if (modalEl && !modalReturnFocus.has(modalEl)) {
+    modalReturnFocus.set(modalEl, document.activeElement);
+  }
+}
+function restoreFocusFor(modalEl) {
+  const target = modalReturnFocus.get(modalEl);
+  modalReturnFocus.delete(modalEl);
+  if (target && document.contains(target) && typeof target.focus === 'function') {
+    target.focus();
+  }
 }
 
 async function apiRequest(url, options = {}) {
-  const res = await fetch(url, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      ...options,
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }
+    });
+  } catch {
+    throw new Error("Can't reach Portly's engine. It may have stopped. Try restarting Portly.");
+  }
   let data = null;
   try {
     data = await res.json();
@@ -288,7 +469,13 @@ async function apiRequest(url, options = {}) {
     data = null;
   }
   if (!res.ok) {
-    throw new Error((data && data.error) || `Request failed (${res.status})`);
+    const err = new Error(
+      (data && data.error) ||
+        `Something went wrong talking to Portly's engine (error ${res.status}). Try again, or export a crash report.`
+    );
+    err.status = res.status;
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -379,7 +566,7 @@ function hideOnboardingScreen() {
 }
 
 function applyTheme(theme) {
-  const normalized = theme === 'dark' ? 'dark' : 'light';
+  const normalized = resolveTheme(theme);
   document.documentElement.setAttribute('data-theme', normalized);
   try {
     localStorage.setItem('devdeck-theme', normalized);
@@ -428,7 +615,7 @@ function applySettings(nextSettings) {
     nextSettings && typeof nextSettings.userName === 'string'
       ? nextSettings.userName.trim()
       : '';
-  const theme = nextSettings && nextSettings.theme === 'dark' ? 'dark' : 'light';
+  const theme = normalizeThemeChoice(nextSettings && nextSettings.theme);
   const defaultExpanded = Boolean(nextSettings && nextSettings.defaultExpanded);
   const allowMultipleInstances = Boolean(nextSettings && nextSettings.allowMultipleInstances);
   const exitClosesCompletely = Boolean(nextSettings && nextSettings.exitClosesCompletely);
@@ -453,8 +640,8 @@ function applySettings(nextSettings) {
   }
   if (els.btnWinClose) {
     const closeLabel = exitClosesCompletely
-      ? 'Close & Shut Down Portly Completely'
-      : 'Close to System Tray (Keep running in background)';
+      ? 'Close and quit Portly'
+      : 'Close window (servers keep running in the system tray)';
     els.btnWinClose.title = closeLabel;
     els.btnWinClose.setAttribute('aria-label', closeLabel);
   }
@@ -467,7 +654,7 @@ function applySettings(nextSettings) {
 }
 
 async function toggleThemeQuick() {
-  const nextTheme = state.settings.theme === 'dark' ? 'light' : 'dark';
+  const nextTheme = resolveTheme(state.settings.theme) === 'dark' ? 'light' : 'dark';
   applySettings({ ...state.settings, theme: nextTheme });
   try {
     const saved = await apiRequest('/api/settings', {
@@ -493,6 +680,9 @@ async function loadSettings() {
 function applySystemInfo(sys) {
   if (!sys || typeof sys !== 'object') return;
   state.system = { ...state.system, ...sys };
+  if (sys.osFamily) {
+    document.documentElement.dataset.os = sys.osFamily;
+  }
 
   if (els.sidebarKbdHint) {
     els.sidebarKbdHint.textContent = sys.shortcutModifier === '⌘' ? '⌘K' : 'Ctrl K';
@@ -591,8 +781,13 @@ function updateSummaryStats() {
   }
 
   els.btnStopAll.disabled = running === 0;
+  // The "don't see your project?" banner and the intro line only help before the first project.
+  const banner = document.querySelector('.studio-callout-banner');
+  if (banner) banner.classList.toggle('hidden', total > 0);
+  const subtitle = document.getElementById('greeting-subtitle');
+  if (subtitle) subtitle.classList.toggle('hidden', total > 0);
   if (els.overviewCollapsedSummary) {
-    els.overviewCollapsedSummary.textContent = `${total} Apps · ${running} Live · ${stopped} Stopped${crashed > 0 ? ` · ${crashed} Crashed` : ''}`;
+    els.overviewCollapsedSummary.textContent = `${total} project${total === 1 ? '' : 's'} · ${running} running · ${stopped} stopped${crashed > 0 ? ` · ${crashed} crashed` : ''}`;
   }
   if (els.titlebarTrayBadge) {
     els.titlebarTrayBadge.textContent = running > 0 ? `${running} running in background` : 'Background ready';
@@ -606,8 +801,7 @@ function updateSummaryStats() {
 
 function renderSidebarProjects() {
   if (state.projects.length === 0) {
-    els.sidebarProjectsList.innerHTML =
-      '<div style="padding:8px 10px;font-size:12px;color:var(--text-muted);">No apps added yet</div>';
+    els.sidebarProjectsList.innerHTML = '<div class="sidebar-empty">No projects yet</div>';
     return;
   }
 
@@ -617,10 +811,10 @@ function renderSidebarProjects() {
       return `
         <button class="sidebar-project-link ${active}" type="button" data-sidebar-project-id="${escapeHtml(p.id)}">
           <span class="sidebar-project-name">
-            <span class="status-dot ${escapeHtml(p.status)}"></span>
+            <span class="status-dot ${escapeHtml(getProjectPhase(p))}" role="img" aria-label="${escapeHtml(getProjectPhase(p))}"></span>
             <span>${escapeHtml(p.name)}</span>
           </span>
-          <span class="sidebar-project-fw">${escapeHtml(p.framework || 'Node')}</span>
+          <span class="sidebar-project-fw">${escapeHtml((p.stackId && state.stacks.find((s) => s.id === p.stackId)?.name) || p.framework || 'Node')}</span>
         </button>
       `;
     })
@@ -642,7 +836,9 @@ function getFilteredProjects() {
       p.programType,
       p.command,
       p.customPort,
-      p.detectedUrl
+      p.detectedUrl,
+      p.hostname,
+      p.stackId && state.stacks.find((s) => s.id === p.stackId)?.name
     ]
       .filter(Boolean)
       .join(' ')
@@ -685,10 +881,17 @@ function renderCommandControl(project) {
   return `<span class="command-code">${escapeHtml(project.command || 'npm run dev')}</span>`;
 }
 
+function renderCrashReason(p) {
+  if (p.status !== 'crashed') return '';
+  const reason = p.crashReason || (p.exitCode !== null && p.exitCode !== undefined ? `Exited (code ${p.exitCode})` : 'Stopped unexpectedly');
+  return `<div class="crash-reason" title="${escapeHtml(reason)}">${escapeHtml(reason)}</div>`;
+}
+
 function renderCardsHtml(list) {
   return list
     .map((p) => {
       const isRunning = p.status === 'running';
+      const phase = getProjectPhase(p);
       const isSelected = p.id === state.selectedLogProjectId;
       const isExpanded = state.expandedCards.has(p.id);
       const activePort = p.assignedPort || p.customPort || p.defaultPort;
@@ -709,19 +912,20 @@ function renderCardsHtml(list) {
             }
           </div>`;
 
-      const compactControlsHtml = isRunning
-        ? `${
-            p.detectedUrl
-              ? `<a class="btn btn-sm btn-success" href="${escapeHtml(p.detectedUrl)}" target="_blank" rel="noopener noreferrer">${iconExternal()}<span>Open ${escapeHtml(p.detectedUrl.replace(/^https?:\/\//, ''))}</span></a>`
-              : `<span class="booting-pill">:${escapeHtml(activePort || 3000)}...</span>`
-          }
-          <button class="btn btn-sm btn-rose-soft" type="button" data-action="stop" data-id="${escapeHtml(p.id)}">${iconStop()}<span>Stop</span></button>`
-        : `<button class="btn btn-sm btn-primary" type="button" data-action="start" data-id="${escapeHtml(p.id)}">${iconPlay()}<span>Start</span></button>
-           <button class="btn btn-sm btn-accent" type="button" data-action="start-open" data-id="${escapeHtml(p.id)}">${iconExternal()}<span>Start &amp; Open</span></button>${
-             p.status === 'crashed'
-               ? `<button class="btn btn-sm btn-rose-soft" type="button" data-action="export-crash" data-id="${escapeHtml(p.id)}" title="Export crash report locally">${iconDownload()}<span>Crash Report</span></button>`
-               : ''
-           }`;
+      // One power control (the switch). The row only adds what the current state needs:
+      // an Open link when the server answers, progress while starting, and the reason after a crash.
+      let compactControlsHtml = '';
+      if (phase === 'running') {
+        compactControlsHtml = `<a class="btn btn-sm btn-success open-link" href="${escapeHtml(projectOpenUrl(p))}" target="_blank" rel="noopener noreferrer" title="Open in your browser">${iconExternal()}<span>${escapeHtml(projectOpenUrl(p).replace(/^https?:\/\//, ''))}</span></a>`;
+      } else if (phase === 'starting') {
+        compactControlsHtml = `<span class="booting-pill" data-starting-id="${escapeHtml(p.id)}">${escapeHtml(getStartingText(p))}</span>`;
+      } else if (phase === 'crashed') {
+        compactControlsHtml = `<button class="btn btn-sm btn-soft" type="button" data-action="start" data-id="${escapeHtml(p.id)}">${iconRestart()}<span>Start again</span></button>
+          <button class="btn btn-sm btn-ghost" type="button" data-action="logs" data-id="${escapeHtml(p.id)}">${iconTerminal()}<span>View logs</span></button>`;
+      }
+      if (p.portConflict && isRunning) {
+        compactControlsHtml += `<span class="port-warning" title="Another program was already using this port when the project started.">Port ${escapeHtml(activePort)} was in use</span>`;
+      }
 
       const stackHtml = techTags.length
         ? `<div class="stack-chips">${techTags
@@ -737,18 +941,20 @@ function renderCardsHtml(list) {
         ? `<button class="btn btn-sm btn-soft" type="button" data-action="restart" data-id="${escapeHtml(p.id)}">${iconRestart()}<span>Restart</span></button>`
         : '';
 
-      const connStatusText = isRunning ? 'Running' : p.status === 'crashed' ? 'Crashed' : 'Stopped';
+      const connStatusText =
+        phase === 'running' ? 'Running' : phase === 'starting' ? 'Starting…' : phase === 'crashed' ? 'Crashed' : 'Stopped';
+      const modKey = state.system.shortcutModifier === '⌘' ? '⌘' : 'Ctrl';
 
       return `
-        <article class="project-card status-${escapeHtml(p.status)} ${isSelected ? 'selected-for-logs' : ''} ${isExpanded ? 'expanded' : ''}" data-project-id="${escapeHtml(p.id)}">
+        <article class="project-card status-${escapeHtml(p.status)} phase-${escapeHtml(phase)} ${isSelected ? 'selected-for-logs' : ''} ${isExpanded ? 'expanded' : ''}" data-project-id="${escapeHtml(p.id)}">
           <div class="card-compact-bar">
-            <div class="card-title-group" data-action="toggle-expand" data-id="${escapeHtml(p.id)}" title="Click to ${isExpanded ? 'collapse' : 'expand'} details">
+            <div class="card-title-group" data-action="logs" data-id="${escapeHtml(p.id)}" title="Show this project's logs">
               <div class="app-avatar ${escapeHtml(p.status)}">${escapeHtml(getAppInitial(p.name))}</div>
               <div class="card-name-block">
                 <div class="card-name-row">
                   <h3 class="project-name">${escapeHtml(p.name)}</h3>
                 </div>
-                <div class="card-made-with">${escapeHtml(p.programType || p.framework || 'Web App')}${activePort ? ` &middot; :${escapeHtml(activePort)}` : ''}</div>
+                <div class="card-made-with">${escapeHtml(p.programType || p.framework || 'Web app')}${activePort ? ` &middot; <span class="card-port">:${escapeHtml(activePort)}</span>` : ''}</div>
               </div>
             </div>
 
@@ -758,6 +964,8 @@ function renderCardsHtml(list) {
             </div>
           </div>
 
+          ${renderCrashReason(p)}
+
           <div class="card-footer-row">
             <div class="card-footer-left">
               <button
@@ -766,26 +974,25 @@ function renderCardsHtml(list) {
                 data-action="toggle-expand"
                 data-id="${escapeHtml(p.id)}"
                 aria-expanded="${isExpanded ? 'true' : 'false'}"
-                title="${isExpanded ? 'Contract card details' : 'Expand card details'}"
+                title="${isExpanded ? 'Hide details' : 'Show details, command and more actions'}"
               >
-                ${iconSettings()}
-                <span>${isExpanded ? 'Hide Details' : 'Configure'}</span>
+                <span>${isExpanded ? 'Hide details' : 'Details'}</span>
                 <span class="configure-chevron">${iconChevron()}</span>
               </button>
               ${compactControlsHtml}
             </div>
 
             <div class="conn-status-group">
-              <span class="conn-status-label ${escapeHtml(p.status)}">${connStatusText}</span>
+              <span class="conn-status-label ${escapeHtml(phase)}">${connStatusText}</span>
               <button
                 class="ios-switch ${isRunning ? 'on' : ''}"
                 type="button"
                 role="switch"
                 aria-checked="${isRunning ? 'true' : 'false'}"
-                aria-label="Toggle ${escapeHtml(p.name)}"
+                aria-label="${isRunning ? 'Stop' : 'Start'} ${escapeHtml(p.name)}"
                 data-action="toggle"
                 data-id="${escapeHtml(p.id)}"
-                title="${isRunning ? 'Turn off server' : 'Turn on server'}"
+                title="${isRunning ? 'Stop server' : `Start server (${modKey}-click to start and open in browser)`}"
               ></button>
             </div>
           </div>
@@ -795,8 +1002,8 @@ function renderCardsHtml(list) {
 
             <div class="card-path-row">
               <span class="card-path" title="${escapeHtml(p.path)}">${escapeHtml(p.path)}</span>
-              <button class="icon-btn" type="button" data-action="copy-path" data-id="${escapeHtml(p.id)}" title="Copy path">${iconCopy()}</button>
-              <button class="icon-btn" type="button" data-action="open-folder" data-id="${escapeHtml(p.id)}" title="Open in ${escapeHtml(state.system.fileManagerLabel || 'File Manager')}">${iconFolder()}</button>
+              <button class="icon-btn" type="button" data-action="copy-path" data-id="${escapeHtml(p.id)}" title="Copy path" aria-label="Copy path">${iconCopy()}</button>
+              <button class="icon-btn" type="button" data-action="open-folder" data-id="${escapeHtml(p.id)}" title="Open in ${escapeHtml(state.system.fileManagerLabel || 'File Manager')}" aria-label="Open folder">${iconFolder()}</button>
             </div>
 
             ${deployNoteHtml}
@@ -812,13 +1019,14 @@ function renderCardsHtml(list) {
             <div class="card-actions">
               <div class="card-actions-left">
                 ${secondaryStartControls}
-                <button class="btn btn-sm btn-ghost" type="button" data-action="logs" data-id="${escapeHtml(p.id)}">${iconTerminal()}<span>View Logs</span></button>
-                <button class="btn btn-sm btn-ghost" type="button" data-action="export-crash" data-id="${escapeHtml(p.id)}" title="Save local crash report">${iconDownload()}<span>Crash Report</span></button>
+                ${isRunning ? '' : `<button class="btn btn-sm btn-ghost" type="button" data-action="start-open" data-id="${escapeHtml(p.id)}">${iconExternal()}<span>Start and open</span></button>`}
+                <button class="btn btn-sm btn-ghost" type="button" data-action="logs" data-id="${escapeHtml(p.id)}">${iconTerminal()}<span>View logs</span></button>
+                <button class="btn btn-sm btn-ghost" type="button" data-action="export-crash" data-id="${escapeHtml(p.id)}" title="Save a crash report with this project's logs">${iconDownload()}<span>Crash report</span></button>
               </div>
               <div class="card-actions-right">
-                <button class="icon-btn" type="button" data-action="reanalyze" data-id="${escapeHtml(p.id)}" title="Re-detect stack & optimal deploy command">${iconSpark()}</button>
-                <button class="icon-btn" type="button" data-action="edit" data-id="${escapeHtml(p.id)}" title="Edit project">${iconSettings()}</button>
-                <button class="icon-btn danger" type="button" data-action="delete" data-id="${escapeHtml(p.id)}" title="Remove project">${iconTrash()}</button>
+                <button class="icon-btn" type="button" data-action="reanalyze" data-id="${escapeHtml(p.id)}" title="Re-detect stack and start command" aria-label="Re-detect stack">${iconSpark()}</button>
+                <button class="icon-btn" type="button" data-action="edit" data-id="${escapeHtml(p.id)}" title="Edit project" aria-label="Edit project">${iconSettings()}</button>
+                <button class="icon-btn danger" type="button" data-action="delete" data-id="${escapeHtml(p.id)}" title="Remove project" aria-label="Remove project">${iconTrash()}</button>
               </div>
             </div>
           </div>
@@ -828,18 +1036,19 @@ function renderCardsHtml(list) {
     .join('');
 }
 
-function renderTableHtml(list) {
-  const rows = list
-    .map((p) => {
+function renderTableRowHtml(p) {
       const isRunning = p.status === 'running';
+      const phase = getProjectPhase(p);
       const isSelected = p.id === state.selectedLogProjectId;
       const activePort = p.assignedPort || p.customPort || p.defaultPort;
       const openAppLink =
         isRunning && p.detectedUrl
-          ? `<a class="btn btn-xs btn-success" href="${escapeHtml(p.detectedUrl)}" target="_blank" rel="noopener noreferrer">${iconExternal()}<span>Open ${escapeHtml(p.detectedUrl.replace(/^https?:\/\//, ''))}</span></a>`
+          ? `<a class="btn btn-xs btn-success" href="${escapeHtml(projectOpenUrl(p))}" target="_blank" rel="noopener noreferrer">${iconExternal()}<span>Open ${escapeHtml(projectOpenUrl(p).replace(/^https?:\/\//, ''))}</span></a>`
           : isRunning
-            ? `<span class="booting-pill">:${escapeHtml(activePort || 3000)}...</span>`
-            : `<button class="btn btn-xs btn-accent" type="button" data-action="start-open" data-id="${escapeHtml(p.id)}">${iconExternal()}<span>Start &amp; Open</span></button>`;
+            ? `<span class="booting-pill" data-starting-id="${escapeHtml(p.id)}">${escapeHtml(getStartingText(p))}</span>`
+            : p.status === 'crashed'
+              ? `<span class="crash-reason crash-reason-inline" title="${escapeHtml(p.crashReason || '')}">${escapeHtml(p.crashReason || 'Crashed')}</span>`
+              : '';
 
       return `
         <tr class="${isSelected ? 'selected-for-logs' : ''}" data-project-id="${escapeHtml(p.id)}">
@@ -849,7 +1058,7 @@ function renderTableHtml(list) {
               type="button"
               role="switch"
               aria-checked="${isRunning ? 'true' : 'false'}"
-              aria-label="Toggle ${escapeHtml(p.name)}"
+              aria-label="${isRunning ? 'Stop' : 'Start'} ${escapeHtml(p.name)}"
               data-action="toggle"
               data-id="${escapeHtml(p.id)}"
             ></button>
@@ -858,7 +1067,7 @@ function renderTableHtml(list) {
             <div style="display:flex;align-items:center;gap:9px;">
               <div class="app-avatar ${escapeHtml(p.status)}" style="width:30px;height:30px;border-radius:9px;font-size:12px;">${escapeHtml(getAppInitial(p.name))}</div>
               <div>
-                <div style="font-weight:700;color:var(--text-primary);">${escapeHtml(p.name)}</div>
+                <div style="font-weight:700;color:var(--text-primary);">${escapeHtml(p.name)} ${tableStackChipHtml(p)}</div>
                 <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;margin-top:2px;">
                   ${p.language ? `<span class="language-badge">${escapeHtml(p.language)}</span>` : ''}
                   <span class="framework-badge">${escapeHtml(p.framework || 'Node.js')}</span>
@@ -873,9 +1082,9 @@ function renderTableHtml(list) {
             <div class="command-chip-wrap">${renderCommandControl(p)}</div>
           </td>
           <td>
-            <span class="status-pill ${escapeHtml(p.status)}">
-              <span class="status-dot ${escapeHtml(p.status)}"></span>
-              <span>${escapeHtml(p.status)}</span>
+            <span class="status-pill ${escapeHtml(phase)}">
+              <span class="status-dot ${escapeHtml(phase)}"></span>
+              <span>${escapeHtml(phase === 'starting' ? 'starting' : p.status)}</span>
             </span>
           </td>
           <td>${openAppLink}</td>
@@ -895,20 +1104,22 @@ function renderTableHtml(list) {
           </td>
         </tr>
       `;
-    })
-    .join('');
+}
+
+function renderTableHtml(list) {
+  const rows = list.map(renderTableRowHtml).join('');
 
   return `
     <div class="projects-table-card">
       <table class="projects-table">
         <thead>
           <tr>
-            <th>Power</th>
+            <th><span class="visually-hidden">On or off</span></th>
             <th>Project &amp; Stack</th>
             <th>Folder Path</th>
             <th>Command</th>
             <th>Status</th>
-            <th>Live Link</th>
+            <th>Open</th>
             <th>Actions</th>
           </tr>
         </thead>
@@ -926,8 +1137,14 @@ function renderProjects() {
   if (state.projects.length === 0) {
     els.projectsGrid.innerHTML = `
       <div class="empty-state">
-        <h3>No projects added yet</h3>
-        <p>Click <strong>Add Project</strong> or <strong>Upload / Bulk Paths</strong> to register your local web apps.</p>
+        <h3>Add your first project</h3>
+        <p>Point Portly at a project folder. It detects the stack, start command and port for you.</p>
+        <div class="empty-state-actions">
+          <button class="btn btn-primary" type="button" data-empty-action="add">Add project</button>
+          <button class="btn btn-soft" type="button" data-empty-action="stack">Add a stack (frontend + API + worker)</button>
+          <button class="btn btn-soft" type="button" data-empty-action="scan">Scan a folder of projects</button>
+          <button class="btn btn-soft" type="button" data-empty-action="bulk">Import list of folders</button>
+        </div>
       </div>
     `;
     return;
@@ -946,14 +1163,14 @@ function renderProjects() {
   if (state.viewMode === 'table') {
     els.projectsGrid.innerHTML = renderTableHtml(list);
   } else {
-    els.projectsGrid.innerHTML = renderCardsHtml(list);
+    els.projectsGrid.innerHTML = renderWorkspaceCardsHtml(list);
   }
 }
 
 function renderLogsHeader() {
   const project = state.projects.find((p) => p.id === state.selectedLogProjectId);
   if (!project) {
-    els.logsProjectTitle.textContent = 'Select a project to view logs';
+    els.logsProjectTitle.textContent = 'Logs';
     els.logsStatusPill.classList.add('hidden');
     els.logsOpenApp.classList.add('hidden');
     els.logsFilePath.textContent = 'No log file selected';
@@ -961,64 +1178,135 @@ function renderLogsHeader() {
   }
 
   els.logsProjectTitle.textContent = project.name;
-  els.logsStatusPill.innerHTML = `<span class="status-dot ${escapeHtml(project.status)}"></span><span>${escapeHtml(project.status.toUpperCase())}</span>`;
-  els.logsStatusPill.className = `status-pill ${project.status}`;
+  const phase = getProjectPhase(project);
+  els.logsStatusPill.innerHTML = `<span class="status-dot ${escapeHtml(phase)}"></span><span>${escapeHtml(phase.toUpperCase())}</span>`;
+  els.logsStatusPill.className = `status-pill ${phase}`;
   els.logsFilePath.textContent = state.logFilePath || `logs/${project.id}.log`;
 
   if (project.status === 'running' && project.detectedUrl) {
-    els.logsOpenApp.href = project.detectedUrl;
-    els.logsOpenApp.innerHTML = `${iconExternal()}<span>Open ${escapeHtml(project.detectedUrl.replace(/^https?:\/\//, ''))}</span>`;
+    els.logsOpenApp.href = projectOpenUrl(project);
+    els.logsOpenApp.innerHTML = `${iconExternal()}<span>Open ${escapeHtml(projectOpenUrl(project).replace(/^https?:\/\//, ''))}</span>`;
     els.logsOpenApp.classList.remove('hidden');
   } else {
     els.logsOpenApp.classList.add('hidden');
   }
 }
 
+const LOG_ERROR_REGEX = /\b(error|err!|exception|traceback|panic|fatal|failed|cannot find|not found)\b/i;
+const LOG_WARN_REGEX = /\b(warn|warning|deprecated)\b/i;
+const MAX_LOG_LINES_ON_SCREEN = 500;
+let pendingLogEntries = [];
+let logFlushScheduled = false;
+
+function logEntryMatchesFilters(entry) {
+  if (state.logStreamFilter !== 'all' && entry.stream !== state.logStreamFilter) {
+    return false;
+  }
+  const search = state.logSearch.trim().toLowerCase();
+  if (search && !String(entry.text || '').toLowerCase().includes(search)) {
+    return false;
+  }
+  return true;
+}
+
+// Many tools (npm, Vite, webpack, Python logging) print normal progress to stderr, so colour
+// a line by what it says rather than by which stream it came from.
+function classifyLogEntry(entry) {
+  if (entry.stream === 'system') return 'tone-system';
+  const text = String(entry.text || '');
+  if (LOG_ERROR_REGEX.test(text)) return 'tone-error';
+  if (LOG_WARN_REGEX.test(text)) return 'tone-warn';
+  return 'tone-normal';
+}
+
+function logLineHtml(entry) {
+  const stream = escapeHtml(entry.stream);
+  return `<div class="log-line ${classifyLogEntry(entry)}">
+        <span class="log-time">${escapeHtml(formatLogTime(entry.timestamp))}</span>
+        <span class="log-stream ${stream}" title="${stream}"><span class="visually-hidden">${stream}</span></span>
+        <span class="log-text ${stream}">${escapeHtml(entry.text)}</span>
+      </div>`;
+}
+
 function renderLogs() {
   renderLogsHeader();
+  pendingLogEntries = [];
   if (!state.selectedLogProjectId) {
-    els.logsOutput.innerHTML =
-      '<div class="logs-empty">Click <strong>Logs</strong> on any project to stream live stdout/stderr and view saved logs.</div>';
+    els.logsOutput.innerHTML = '<div class="logs-empty">Select a project to see its output.</div>';
     return;
   }
 
-  const search = state.logSearch.trim().toLowerCase();
-  const filtered = state.logs.filter((entry) => {
-    if (state.logStreamFilter !== 'all' && entry.stream !== state.logStreamFilter) {
-      return false;
-    }
-    if (search && !String(entry.text || '').toLowerCase().includes(search)) {
-      return false;
-    }
-    return true;
-  });
+  const filtered = state.logs.filter(logEntryMatchesFilters);
 
   if (filtered.length === 0) {
     els.logsOutput.innerHTML =
-      '<div class="logs-empty">No logs recorded yet for this filter. Turn on the project to stream live output.</div>';
+      '<div class="logs-empty">No output yet for this filter. Start the project to stream its output here.</div>';
     return;
   }
 
-  els.logsOutput.innerHTML = filtered
-    .map(
-      (entry) => `
-      <div class="log-line">
-        <span class="log-time">${escapeHtml(formatLogTime(entry.timestamp))}</span>
-        <span class="log-stream ${escapeHtml(entry.stream)}">${escapeHtml(entry.stream)}</span>
-        <span class="log-text ${escapeHtml(entry.stream)}">${escapeHtml(entry.text)}</span>
-      </div>
-    `
-    )
-    .join('');
+  els.logsOutput.innerHTML = filtered.slice(-MAX_LOG_LINES_ON_SCREEN).map(logLineHtml).join('');
 
   if (state.autoScroll) {
     els.logsOutput.scrollTop = els.logsOutput.scrollHeight;
   }
 }
 
+/** Appends new log lines without rebuilding the whole console (batched per animation frame). */
+function flushPendingLogs() {
+  logFlushScheduled = false;
+  if (document.hidden) {
+    state.needsFullRender = true;
+    pendingLogEntries = [];
+    return;
+  }
+  const entries = pendingLogEntries.filter(logEntryMatchesFilters);
+  pendingLogEntries = [];
+  if (entries.length === 0) return;
+
+  if (els.logsOutput.querySelector('.logs-empty')) {
+    renderLogs();
+    return;
+  }
+  const tpl = document.createElement('template');
+  tpl.innerHTML = entries.slice(-MAX_LOG_LINES_ON_SCREEN).map(logLineHtml).join('');
+  els.logsOutput.appendChild(tpl.content);
+  let extra = els.logsOutput.childElementCount - MAX_LOG_LINES_ON_SCREEN;
+  while (extra > 0 && els.logsOutput.firstElementChild) {
+    els.logsOutput.firstElementChild.remove();
+    extra -= 1;
+  }
+  if (state.autoScroll) {
+    els.logsOutput.scrollTop = els.logsOutput.scrollHeight;
+  }
+}
+
+function receiveLogEntries(projectId, entries) {
+  if (projectId !== state.selectedLogProjectId || !Array.isArray(entries) || entries.length === 0) {
+    return;
+  }
+  state.logs.push(...entries);
+  if (state.logs.length > MAX_LOG_LINES_ON_SCREEN) {
+    state.logs.splice(0, state.logs.length - MAX_LOG_LINES_ON_SCREEN);
+  }
+  pendingLogEntries.push(...entries);
+  if (!logFlushScheduled) {
+    logFlushScheduled = true;
+    requestAnimationFrame(flushPendingLogs);
+  }
+}
+
+function updateSelectionHighlight() {
+  for (const el of els.projectsGrid.querySelectorAll('[data-project-id]')) {
+    el.classList.toggle('selected-for-logs', el.dataset.projectId === state.selectedLogProjectId);
+  }
+  for (const el of els.sidebarProjectsList.querySelectorAll('[data-sidebar-project-id]')) {
+    el.classList.toggle('active', el.dataset.sidebarProjectId === state.selectedLogProjectId);
+  }
+}
+
 async function selectLogProject(id) {
   state.selectedLogProjectId = id;
-  renderProjects();
+  updateSelectionHighlight();
   renderLogsHeader();
   try {
     const data = await apiRequest(`/api/projects/${encodeURIComponent(id)}/logs`);
@@ -1032,7 +1320,7 @@ async function selectLogProject(id) {
 
 async function loadProjects() {
   try {
-    const list = await apiRequest('/api/projects');
+    const [list] = await Promise.all([apiRequest('/api/projects'), loadStacks()]);
     state.projects = Array.isArray(list) ? list : [];
 
     if (state.settings.defaultExpanded) {
@@ -1062,11 +1350,11 @@ function fulfillPendingOpenTab(project) {
     pendingOpenTabs.delete(project.id);
     if (pending.win && !pending.win.closed) {
       pending.win.opener = null;
-      pending.win.location.href = project.detectedUrl;
+      pending.win.location.href = projectOpenUrl(project);
     } else {
-      window.open(project.detectedUrl, '_blank', 'noopener,noreferrer');
+      window.open(projectOpenUrl(project), '_blank', 'noopener,noreferrer');
     }
-    showToast(`Opened ${project.name} at ${project.detectedUrl}`);
+    showToast(`Opened ${project.name} at ${projectOpenUrl(project)}`);
   } else if (project.status === 'crashed' || project.status === 'stopped') {
     clearTimeout(pending.timer);
     pendingOpenTabs.delete(project.id);
@@ -1076,8 +1364,55 @@ function fulfillPendingOpenTab(project) {
   }
 }
 
+/**
+ * Replaces just one project's card (or table row) and sidebar entry instead of rebuilding
+ * the whole grid. Returns false when a full render is needed (for example the project
+ * now enters or leaves the current filter).
+ */
+function patchProjectDom(updated) {
+  // Services are drawn inside their stack's card; the stack-status event redraws it.
+  if (updated.stackId && state.viewMode !== 'table') return false;
+  const inList = getFilteredProjects().some((p) => p.id === updated.id);
+  const el = els.projectsGrid.querySelector(`[data-project-id="${CSS.escape(updated.id)}"]`);
+  if (!inList) return !el;
+  if (!el) return false;
+
+  const isTable = state.viewMode === 'table';
+  const container = document.createElement(isTable ? 'tbody' : 'div');
+  container.innerHTML = (isTable ? renderTableRowHtml(updated) : renderCardsHtml([updated])).trim();
+  const fresh = container.firstElementChild;
+  if (!fresh) return false;
+  fresh.classList.add('no-anim');
+
+  // Keep keyboard focus on the same control if it was inside this card.
+  const focused = el.contains(document.activeElement) ? document.activeElement : null;
+  const focusedAction = focused && focused.dataset ? focused.dataset.action : null;
+  el.replaceWith(fresh);
+  if (focusedAction) {
+    const again = fresh.querySelector(`[data-action="${focusedAction}"]`);
+    if (again) again.focus();
+  }
+
+  const row = els.sidebarProjectsList.querySelector(
+    `[data-sidebar-project-id="${CSS.escape(updated.id)}"]`
+  );
+  if (row) {
+    const dot = row.querySelector('.status-dot');
+    if (dot) {
+      const phase = getProjectPhase(updated);
+      dot.className = `status-dot ${phase}`;
+      dot.setAttribute('aria-label', phase);
+    }
+  } else {
+    renderSidebarProjects();
+  }
+  updateSummaryStats();
+  return true;
+}
+
 function upsertProjectState(updated) {
   const idx = state.projects.findIndex((p) => p.id === updated.id);
+  const previous = idx >= 0 ? state.projects[idx] : null;
   if (idx >= 0) {
     state.projects[idx] = updated;
   } else {
@@ -1087,11 +1422,34 @@ function upsertProjectState(updated) {
     }
   }
   fulfillPendingOpenTab(updated);
-  renderProjects();
+
+  if (previous && previous.status !== 'crashed' && updated.status === 'crashed' && !document.hidden) {
+    showToast(`${updated.name} crashed. ${updated.crashReason || ''}`.trim(), 'error', {
+      actionLabel: 'View logs',
+      onAction: () => selectLogProject(updated.id)
+    });
+  }
+
+  if (document.hidden) {
+    state.needsFullRender = true;
+    return;
+  }
+  if (!previous || !patchProjectDom(updated)) {
+    renderProjects();
+  }
   if (updated.id === state.selectedLogProjectId) {
     renderLogsHeader();
   }
 }
+
+// While Portly is hidden (tray or minimized), keep state current but skip DOM work.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && state.needsFullRender) {
+    state.needsFullRender = false;
+    renderProjects();
+    renderLogs();
+  }
+});
 
 function connectSSE() {
   if (state.sse) {
@@ -1140,23 +1498,28 @@ function connectSSE() {
       const payload = JSON.parse(ev.data);
       const msg =
         (payload && payload.message) ||
-        'Only 1 instance of Portly can be used at a time.';
-      showToast(msg, payload && payload.restoredFrom === 'desktop' ? 'error' : 'success');
+        'Portly is already open, so we brought it to the front.';
+      showToast(msg);
     } catch {
-      showToast('Only 1 instance of Portly can be used at a time.');
+      showToast('Portly is already open, so we brought it to the front.');
     }
   });
 
+  // Log lines arrive in batches (one event per ~75 ms per project).
+  sse.addEventListener('project-logs', (ev) => {
+    try {
+      const payload = JSON.parse(ev.data);
+      receiveLogEntries(payload.projectId, payload.entries);
+    } catch {
+      // Ignore malformed SSE log
+    }
+  });
+
+  // Older Portly engines sent one event per line.
   sse.addEventListener('project-log', (ev) => {
     try {
       const payload = JSON.parse(ev.data);
-      if (payload.projectId === state.selectedLogProjectId && payload.entry) {
-        state.logs.push(payload.entry);
-        if (state.logs.length > 500) {
-          state.logs.splice(0, state.logs.length - 500);
-        }
-        renderLogs();
-      }
+      if (payload.entry) receiveLogEntries(payload.projectId, [payload.entry]);
     } catch {
       // Ignore malformed SSE log
     }
@@ -1182,6 +1545,8 @@ function connectSSE() {
     }
   });
 
+  stacksUiBindSse(sse);
+
   sse.onerror = () => {
     if (els.sseBadge && els.sseBadgeText) {
       els.sseBadge.className = 'sse-badge disconnected';
@@ -1192,9 +1557,7 @@ function connectSSE() {
 
 function applyFilter(filterValue) {
   state.filter = filterValue;
-  for (const t of els.filterTabs) {
-    t.classList.toggle('active', t.dataset.filter === filterValue);
-  }
+  setPressed(els.filterTabs, (t) => t.dataset.filter === filterValue);
   renderProjects();
 }
 
@@ -1351,20 +1714,27 @@ function applyLayoutPrefs() {
 function switchViewMode(view) {
   state.viewMode = view;
   els.workspaceGrid.className = `workspace view-${view}`;
-  for (const btn of els.viewBtns) {
-    btn.classList.toggle('active', btn.dataset.view === view);
-  }
+  setPressed(els.viewBtns, (btn) => btn.dataset.view === view);
   applyLayoutPrefs();
   renderProjects();
 }
 
 // Settings Modal
 function syncThemeChoiceButtons(choice) {
-  pendingSettingsTheme = choice === 'dark' ? 'dark' : 'light';
-  for (const btn of els.themeChoiceBtns) {
-    btn.classList.toggle('active', btn.dataset.themeChoice === pendingSettingsTheme);
-  }
+  pendingSettingsTheme = normalizeThemeChoice(choice);
+  setPressed(els.themeChoiceBtns, (btn) => btn.dataset.themeChoice === pendingSettingsTheme);
   applyTheme(pendingSettingsTheme);
+}
+
+if (systemDarkQuery) {
+  const onSystemThemeChange = () => {
+    if (state.settings.theme === 'system') applyTheme('system');
+  };
+  if (typeof systemDarkQuery.addEventListener === 'function') {
+    systemDarkQuery.addEventListener('change', onSystemThemeChange);
+  } else if (typeof systemDarkQuery.addListener === 'function') {
+    systemDarkQuery.addListener(onSystemThemeChange);
+  }
 }
 
 function openSettingsModal() {
@@ -1379,6 +1749,8 @@ function openSettingsModal() {
   syncThemeChoiceButtons(state.settings.theme);
   syncConfigModeButtons(state.configImportMode);
   updateReopenBrokenPathsButton();
+  stacksUiOnSettingsOpen();
+  rememberFocusFor(els.settingsModal);
   els.settingsModal.classList.remove('hidden');
   els.inputUserName.focus();
 }
@@ -1386,7 +1758,11 @@ function openSettingsModal() {
 function closeSettingsModal() {
   els.settingsModal.classList.add('hidden');
   applyTheme(state.settings.theme);
+  restoreFocusFor(els.settingsModal);
 }
+
+// Lets the macOS app menu (Portly > Settings…, Cmd+,) open Settings.
+window.portlyOpenSettings = openSettingsModal;
 
 // Add/Edit Project Modal
 function switchModalTab(tabName) {
@@ -1394,6 +1770,11 @@ function switchModalTab(tabName) {
     tab.classList.toggle('active', tab.dataset.tab === tabName);
   }
   els.singleForm.classList.toggle('hidden', tabName !== 'single');
+  const stackForm = document.getElementById('stack-form');
+  if (stackForm) {
+    stackForm.classList.toggle('hidden', tabName !== 'stack');
+    if (tabName === 'stack' && !stacksUi.suggestion) resetStackForm();
+  }
   els.bulkForm.classList.toggle('hidden', tabName !== 'bulk');
 }
 
@@ -1407,7 +1788,7 @@ function resetInspectUI() {
 function openAddModal(defaultTab = 'single', scanSubfolders = false) {
   els.editProjectId.value = '';
   els.modalTitle.textContent =
-    defaultTab === 'bulk' ? 'Upload / Bulk Import Project Paths' : 'Add Local Project';
+    defaultTab === 'bulk' ? 'Import a list of folders' : 'Add project';
   els.modalTabsWrap.classList.remove('hidden');
   els.btnSubmitSingle.textContent = 'Add Project';
   els.singleForm.reset();
@@ -1419,12 +1800,18 @@ function openAddModal(defaultTab = 'single', scanSubfolders = false) {
   els.bulkResultBox.classList.add('hidden');
   els.bulkResultBox.innerHTML = '';
   els.inputScanSubfolders.checked = scanSubfolders;
+  stacksUiOnOpenAdd();
+  if (defaultTab === 'stack') resetStackForm();
 
   switchModalTab(defaultTab);
+  rememberFocusFor(els.modal);
   els.modal.classList.remove('hidden');
 
   if (defaultTab === 'single') {
     els.inputPath.focus();
+  } else if (defaultTab === 'stack') {
+    const stackPath = document.getElementById('input-stack-path');
+    if (stackPath) stackPath.focus();
   } else {
     els.inputBulkPaths.focus();
   }
@@ -1432,7 +1819,7 @@ function openAddModal(defaultTab = 'single', scanSubfolders = false) {
 
 function openEditModal(project) {
   els.editProjectId.value = project.id;
-  els.modalTitle.textContent = `Edit Project — ${project.name}`;
+  els.modalTitle.textContent = `Edit ${project.name}`;
   els.modalTabsWrap.classList.add('hidden');
   els.btnSubmitSingle.textContent = 'Save Changes';
   els.singleFormError.classList.add('hidden');
@@ -1442,14 +1829,18 @@ function openEditModal(project) {
   els.inputName.value = project.name;
   els.inputPort.value = project.customPort || '';
   els.inputCommand.value = project.command || 'npm run dev';
+  stacksUiOnOpenEdit(project);
 
   switchModalTab('single');
+  rememberFocusFor(els.modal);
   els.modal.classList.remove('hidden');
+  els.inputName.focus();
   runInspectPath(project.path, true);
 }
 
 function closeModal() {
   els.modal.classList.add('hidden');
+  restoreFocusFor(els.modal);
 }
 
 async function runInspectPath(rawPath, preserveExistingFields = false) {
@@ -1657,6 +2048,9 @@ function applyImportedEnvironmentResponse(res) {
     saveLayoutPrefs();
   }
 
+  if (Array.isArray(res.stacks)) {
+    state.stacks = res.stacks;
+  }
   if (Array.isArray(res.projects)) {
     state.projects = res.projects;
   }
@@ -2081,10 +2475,38 @@ async function handleImportConfigFile(file) {
     } catch {
       throw new Error('Selected file is not valid JSON.');
     }
-    const res = await apiRequest('/api/config/import', {
-      method: 'POST',
-      body: JSON.stringify({ config: parsed, mode: state.configImportMode })
-    });
+    let res;
+    try {
+      res = await apiRequest('/api/config/import', {
+        method: 'POST',
+        body: JSON.stringify({ config: parsed, mode: state.configImportMode })
+      });
+    } catch (err) {
+      if (!(err.status === 409 && err.data && err.data.needsConfirmation)) throw err;
+      // Config files can come from anywhere: show every command they would add or change.
+      const changes = Array.isArray(err.data.commandChanges) ? err.data.commandChanges : [];
+      const listHtml = changes.length
+        ? `<ul class="confirm-list">${changes
+            .map(
+              (c) => `<li><strong>${escapeHtml(c.name)}</strong> <span class="muted">${escapeHtml(c.path)}</span><br />
+                ${c.from ? `<code class="confirm-old">${escapeHtml(c.from)}</code> → ` : ''}<code class="confirm-new">${escapeHtml(c.to)}</code></li>`
+            )
+            .join('')}</ul>`
+        : '';
+      const replacing = Number(err.data.replacesProjects) || 0;
+      const ok = await confirmDialog({
+        title: 'Review this config before importing',
+        message: `${changes.length ? `It sets ${changes.length} start command${changes.length === 1 ? '' : 's'}. These run on your computer when you press Start, so only continue if you trust where this file came from.` : ''}${replacing ? ` Replace mode stops all running servers and replaces your ${replacing} current project${replacing === 1 ? '' : 's'}.` : ''}`.trim(),
+        detailsHtml: listHtml,
+        confirmLabel: 'Import',
+        danger: true
+      });
+      if (!ok) return;
+      res = await apiRequest('/api/config/import', {
+        method: 'POST',
+        body: JSON.stringify({ config: parsed, mode: state.configImportMode, confirmCommands: true })
+      });
+    }
     applyImportedEnvironmentResponse(res);
     closeSettingsModal();
     const brokenList =
@@ -2551,14 +2973,98 @@ for (const btn of els.viewBtns) {
 els.projectSearch.addEventListener('input', (e) => setSearchValue(e.target.value, els.projectSearch));
 els.sidebarSearch.addEventListener('input', (e) => setSearchValue(e.target.value, els.sidebarSearch));
 
+function getOpenModal() {
+  const open = Array.from(document.querySelectorAll('.modal-backdrop:not(.hidden)')).filter(
+    (m) => !m.classList.contains('confirm-dialog') && getComputedStyle(m).display !== 'none'
+  );
+  return open.length ? open[open.length - 1] : null;
+}
+
+function closeModalElement(modalEl) {
+  if (modalEl === els.modal) closeModal();
+  else if (modalEl === els.settingsModal) closeSettingsModal();
+  else if (els.brokenPathsModal && modalEl === els.brokenPathsModal) closeBrokenPathsModal();
+  else if (modalEl && modalEl.id === 'stack-modal') closeStackModal();
+}
+
+function isTypingTarget(el) {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+}
+
+function moveProjectSelection(delta) {
+  const list = getFilteredProjects();
+  if (list.length === 0) return;
+  const idx = list.findIndex((p) => p.id === state.selectedLogProjectId);
+  const next = list[Math.max(0, Math.min(list.length - 1, idx < 0 ? 0 : idx + delta))];
+  selectLogProject(next.id);
+  const card = els.projectsGrid.querySelector(`[data-project-id="${CSS.escape(next.id)}"]`);
+  if (card) card.scrollIntoView({ block: 'nearest' });
+}
+
+const SHORTCUT_HELP =
+  'Shortcuts: ↑/↓ select project · Space start/stop · Enter or O open in browser · R restart · L focus logs · Ctrl/⌘+N add project · Ctrl/⌘+K search · Ctrl/⌘+Shift+S stop all';
+
 document.addEventListener('keydown', (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+  const mod = e.metaKey || e.ctrlKey;
+  const modal = getOpenModal();
+
+  if (modal) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      closeModalElement(modal);
+    } else if (e.key === 'Tab') {
+      trapFocus(modal.querySelector('.modal-card') || modal, e);
+    }
+    return;
+  }
+
+  if (mod && e.key.toLowerCase() === 'k') {
     e.preventDefault();
     els.sidebarSearch.focus();
+    return;
   }
-  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === 'r') {
+  if (mod && !e.shiftKey && e.key.toLowerCase() === 'n') {
     e.preventDefault();
-    triggerReloadWithFadeToDark();
+    openAddModal('single');
+    return;
+  }
+  if (mod && e.shiftKey && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    if (!els.btnStopAll.disabled) els.btnStopAll.click();
+    return;
+  }
+  if (mod || e.altKey || isTypingTarget(e.target)) return;
+
+  const selected = state.projects.find((p) => p.id === state.selectedLogProjectId);
+  const onButton = e.target && e.target.closest && e.target.closest('button, a');
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (onButton && e.target.closest('.segmented-control, .filter-pills, .stream-filters')) return;
+    e.preventDefault();
+    moveProjectSelection(e.key === 'ArrowDown' ? 1 : -1);
+  } else if (e.key === ' ' && selected && !onButton) {
+    e.preventDefault();
+    const action = selected.status === 'running' ? 'stop' : 'start';
+    apiRequest(`/api/projects/${encodeURIComponent(selected.id)}/${action}`, { method: 'POST' }).catch(
+      (err) => showToast(err.message, 'error')
+    );
+  } else if ((e.key === 'Enter' && !onButton) || e.key.toLowerCase() === 'o') {
+    if (selected && selected.status === 'running' && selected.detectedUrl) {
+      e.preventDefault();
+      window.open(projectOpenUrl(selected), '_blank', 'noopener,noreferrer');
+    }
+  } else if (e.key.toLowerCase() === 'r' && selected && selected.status === 'running') {
+    e.preventDefault();
+    apiRequest(`/api/projects/${encodeURIComponent(selected.id)}/restart`, { method: 'POST' }).catch(
+      (err) => showToast(err.message, 'error')
+    );
+  } else if (e.key.toLowerCase() === 'l') {
+    e.preventDefault();
+    els.logsOutput.focus();
+  } else if (e.key === '?') {
+    e.preventDefault();
+    showToast(SHORTCUT_HELP, 'success', { duration: 9000 });
   }
 });
 
@@ -2579,7 +3085,7 @@ els.sidebarProjectsList.addEventListener('click', async (e) => {
 for (const btn of els.streamBtns) {
   btn.addEventListener('click', () => {
     state.logStreamFilter = btn.dataset.stream;
-    for (const b of els.streamBtns) b.classList.toggle('active', b === btn);
+    setPressed(els.streamBtns, (b) => b === btn);
     renderLogs();
   });
 }
@@ -2611,16 +3117,60 @@ els.btnCopyLogs.addEventListener('click', async () => {
 
 els.btnClearLogs.addEventListener('click', async () => {
   if (!state.selectedLogProjectId) return;
+  const project = state.projects.find((p) => p.id === state.selectedLogProjectId);
+  const ok = await confirmDialog({
+    title: 'Clear log file?',
+    message: `This deletes the saved log for ${project ? project.name : 'this project'} from disk. It can't be undone.`,
+    confirmLabel: 'Clear log file',
+    danger: true
+  });
+  if (!ok) return;
   try {
     await apiRequest(`/api/projects/${encodeURIComponent(state.selectedLogProjectId)}/logs`, {
       method: 'DELETE'
     });
     state.logs = [];
     renderLogs();
-    showToast('Cleared project log file.');
+    showToast('Log file cleared.');
   } catch (err) {
     showToast(err.message, 'error');
   }
+});
+
+// Opens the project in the browser as soon as its server answers.
+function openWhenReady(project) {
+  const existing = pendingOpenTabs.get(project.id);
+  if (existing) clearTimeout(existing.timer);
+  // In a normal browser a tab opened later would be blocked as a popup, so open a placeholder
+  // tab now (during the click). The desktop app routes the final URL to your browser instead.
+  let win = null;
+  if (!document.documentElement.dataset.titlebar) {
+    try {
+      win = window.open('about:blank', '_blank');
+      if (win && win.document) {
+        win.document.title = `Starting ${project.name}…`;
+        win.document.body.textContent = `Starting ${project.name}… This tab will load it as soon as the server is ready.`;
+      }
+    } catch {
+      win = null;
+    }
+  }
+  const timer = setTimeout(() => {
+    pendingOpenTabs.delete(project.id);
+    if (win && !win.closed) win.close();
+  }, 60000);
+  pendingOpenTabs.set(project.id, { win, timer });
+}
+
+// Empty-state buttons
+els.projectsGrid.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-empty-action]');
+  if (!btn) return;
+  const kind = btn.dataset.emptyAction;
+  if (kind === 'add') openAddModal('single');
+  else if (kind === 'bulk') openAddModal('bulk');
+  else if (kind === 'stack') openAddModal('stack');
+  else if (kind === 'scan' && els.btnScanFolder) els.btnScanFolder.click();
 });
 
 // Project Card & Table Delegated Actions
@@ -2641,38 +3191,24 @@ els.projectsGrid.addEventListener('click', async (e) => {
         state.expandedCards.add(id);
       }
       renderProjects();
+    } else if (action === 'toggle' && project && project.status !== 'running' && (e.ctrlKey || e.metaKey)) {
+      // Ctrl/Cmd-click on the switch: start and open in the browser once it's up.
+      openWhenReady(project);
+      selectLogProject(id);
+      const started = await apiRequest(`/api/projects/${encodeURIComponent(id)}/start`, { method: 'POST' });
+      upsertProjectState(started);
     } else if (action === 'toggle' && project) {
       if (project.status === 'running') {
         await apiRequest(`/api/projects/${encodeURIComponent(id)}/stop`, { method: 'POST' });
       } else {
-        await apiRequest(`/api/projects/${encodeURIComponent(id)}/start`, { method: 'POST' });
         selectLogProject(id);
+        await apiRequest(`/api/projects/${encodeURIComponent(id)}/start`, { method: 'POST' });
       }
     } else if (action === 'start') {
       await apiRequest(`/api/projects/${encodeURIComponent(id)}/start`, { method: 'POST' });
       selectLogProject(id);
     } else if (action === 'start-open' && project) {
-      let win = null;
-      try {
-        win = window.open('about:blank', '_blank');
-        if (win && win.document) {
-          win.document.write(
-            '<!doctype html><html><head><title>Starting ' +
-              escapeHtml(project.name) +
-              '...</title><style>body{margin:0;height:100vh;display:grid;place-items:center;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#0b1120;color:#f8fafc}.box{background:#161f33;padding:28px 34px;border-radius:20px;box-shadow:0 16px 40px rgba(0,0,0,.35);text-align:center}h2{margin:0 0 8px;font-size:18px}p{margin:0;color:#94a3b8;font-size:13px}</style></head><body><div class="box"><h2>Starting ' +
-              escapeHtml(project.name) +
-              '...</h2><p>Waiting for dev server to bind its port. This tab will redirect automatically.</p></div></body></html>'
-          );
-          win.document.close();
-        }
-      } catch {
-        win = null;
-      }
-      const timer = setTimeout(() => {
-        pendingOpenTabs.delete(id);
-        if (win && !win.closed) win.close();
-      }, 45000);
-      pendingOpenTabs.set(id, { win, timer });
+      openWhenReady(project);
       const started = await apiRequest(`/api/projects/${encodeURIComponent(id)}/start`, {
         method: 'POST'
       });
@@ -2696,11 +3232,38 @@ els.projectsGrid.addEventListener('click', async (e) => {
     } else if (action === 'edit' && project) {
       openEditModal(project);
     } else if (action === 'delete' && project) {
-      if (!confirm(`Remove "${project.name}" from Portly? (Files on disk will not be deleted.)`)) {
-        return;
-      }
+      const ok = await confirmDialog({
+        title: `Remove ${project.name}?`,
+        message: 'Portly will stop it if it is running and forget it. The files on disk are not touched.',
+        confirmLabel: 'Remove',
+        danger: true
+      });
+      if (!ok) return;
       await apiRequest(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      showToast(`Removed ${project.name}`);
+      showToast(`Removed ${project.name}.`, 'success', {
+        actionLabel: 'Undo',
+        duration: 8000,
+        onAction: async () => {
+          try {
+            const restored = await apiRequest('/api/projects', {
+              method: 'POST',
+              body: JSON.stringify({
+                path: project.path,
+                name: project.name,
+                command: project.command,
+                customPort: project.customPort || '',
+                ...(project.stackId && state.stacks.some((s) => s.id === project.stackId)
+                  ? { stackId: project.stackId, kind: project.kind }
+                  : {})
+              })
+            });
+            upsertProjectState(restored);
+            showToast(`Restored ${project.name}.`);
+          } catch (err) {
+            showToast(err.message, 'error');
+          }
+        }
+      });
     } else if (action === 'copy-path' && project) {
       await navigator.clipboard.writeText(project.path);
       showToast('Copied path to clipboard.');
@@ -2901,7 +3464,11 @@ for (const tab of els.modalTabs) {
   tab.addEventListener('click', () => {
     switchModalTab(tab.dataset.tab);
     els.modalTitle.textContent =
-      tab.dataset.tab === 'bulk' ? 'Upload / Bulk Import Project Paths' : 'Add Local Project';
+      tab.dataset.tab === 'bulk'
+        ? 'Import a list of folders'
+        : tab.dataset.tab === 'stack'
+          ? 'Add a stack'
+          : 'Add project';
   });
 }
 
@@ -2946,7 +3513,8 @@ els.singleForm.addEventListener('submit', async (e) => {
     path: els.inputPath.value.trim(),
     name: els.inputName.value.trim(),
     command: els.inputCommand.value.trim() || 'npm run dev',
-    customPort: els.inputPort.value.trim()
+    customPort: els.inputPort.value.trim(),
+    ...stacksUiCollectPayload(Boolean(editId))
   };
 
   try {
@@ -2955,14 +3523,16 @@ els.singleForm.addEventListener('submit', async (e) => {
         method: 'PUT',
         body: JSON.stringify(payload)
       });
+      await stacksUiAfterSave(editId);
       showToast('Project updated.');
     } else {
       const created = await apiRequest('/api/projects', {
         method: 'POST',
         body: JSON.stringify(payload)
       });
+      await stacksUiAfterSave(created.id);
       showToast(`Added ${created.name}`);
-      if (!state.selectedLogProjectId) {
+      if (!state.selectedLogProjectId || payload.stackId) {
         selectLogProject(created.id);
       }
     }
@@ -3105,6 +3675,11 @@ els.bulkForm.addEventListener('submit', async (e) => {
 
 // Live 1-second uptime & greeting refresher
 setInterval(() => {
+  if (document.hidden) return;
+  for (const el of document.querySelectorAll('[data-starting-id]')) {
+    const project = state.projects.find((p) => p.id === el.dataset.startingId);
+    if (project) el.textContent = getStartingText(project);
+  }
   const uptimeEls = document.querySelectorAll('[data-uptime-id]');
   for (const el of uptimeEls) {
     const id = el.dataset.uptimeId;
@@ -3120,9 +3695,23 @@ setInterval(renderGreetingAndProfile, 60000);
 // Initialize
 loadLayoutPrefs();
 applyLayoutPrefs();
+async function loadNotices() {
+  try {
+    const res = await apiRequest('/api/notices');
+    for (const notice of (res && res.notices) || []) {
+      showToast(notice.message, notice.level === 'error' ? 'error' : 'success', { sticky: true });
+    }
+  } catch {
+    // Older engine without notices
+  }
+}
+
+stacksUiInit();
+
 (async () => {
   await Promise.all([loadSystemInfo(), loadSettings()]);
   playEntranceTransition();
   await loadProjects();
   connectSSE();
+  loadNotices();
 })();

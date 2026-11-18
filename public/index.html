@@ -3,9 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Portly — Local App Studio</title>
+  <title>Portly</title>
   <link rel="icon" type="image/png" href="/portly-logo-white.png" />
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/stacks.css" />
 </head>
 <body>
   <!-- Bright-light entrance / fade-to-dark exit overlay -->
@@ -33,7 +34,7 @@
             <rect x="4" y="4" width="16" height="16" rx="2"></rect>
           </svg>
         </button>
-        <button id="btn-win-close" class="win-btn win-btn-close" type="button" title="Exit to System Tray (keeps running in background)" aria-label="Exit to system tray">
+        <button id="btn-win-close" class="win-btn win-btn-close" type="button" title="Close window (servers keep running in the system tray)" aria-label="Close window">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
             <path d="M18 6 6 18M6 6l12 12"></path>
           </svg>
@@ -52,7 +53,7 @@
             <div class="brand-name-row">
               <span class="brand-name">Portly</span>
             </div>
-            <span class="brand-sub">Local App Studio</span>
+            <span class="brand-sub">Local dev servers</span>
           </div>
         </div>
       </div>
@@ -62,13 +63,13 @@
           <circle cx="11" cy="11" r="8"></circle>
           <path d="m21 21-4.3-4.3"></path>
         </svg>
-        <input id="sidebar-search" type="search" placeholder="Quick search" autocomplete="off" />
+        <input id="sidebar-search" type="search" placeholder="Search" aria-label="Search projects" autocomplete="off" />
         <kbd id="sidebar-kbd-hint" class="kbd-hint">Ctrl K</kbd>
       </div>
 
       <nav class="sidebar-section" aria-label="Filter projects by status">
         <div class="sidebar-section-label">Workspace</div>
-        <button class="sidebar-item filter-tab active" data-filter="all" type="button">
+        <button class="sidebar-item filter-tab active" data-filter="all" type="button" aria-pressed="true">
           <span class="sidebar-item-left">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect width="7" height="7" x="3" y="3" rx="2"></rect>
@@ -76,12 +77,12 @@
               <rect width="7" height="7" x="14" y="14" rx="2"></rect>
               <rect width="7" height="7" x="3" y="14" rx="2"></rect>
             </svg>
-            <span>All Projects</span>
+            <span>All projects</span>
           </span>
           <span id="nav-count-all" class="nav-count">0</span>
         </button>
 
-        <button class="sidebar-item filter-tab" data-filter="running" type="button">
+        <button class="sidebar-item filter-tab" data-filter="running" type="button" aria-pressed="false">
           <span class="sidebar-item-left">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="9"></circle>
@@ -92,7 +93,7 @@
           <span id="nav-count-running" class="nav-count running">0</span>
         </button>
 
-        <button class="sidebar-item filter-tab" data-filter="stopped" type="button">
+        <button class="sidebar-item filter-tab" data-filter="stopped" type="button" aria-pressed="false">
           <span class="sidebar-item-left">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="9"></circle>
@@ -103,7 +104,7 @@
           <span id="nav-count-stopped" class="nav-count">0</span>
         </button>
 
-        <button class="sidebar-item filter-tab" data-filter="crashed" type="button">
+        <button class="sidebar-item filter-tab" data-filter="crashed" type="button" aria-pressed="false">
           <span class="sidebar-item-left">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"></path>
@@ -125,9 +126,8 @@
               <path d="M12 8v8"></path>
               <path d="M8 12h8"></path>
             </svg>
-            <span>New Project</span>
+            <span>Add project</span>
           </span>
-          <span class="nav-ext-arrow" aria-hidden="true">&#8599;</span>
         </button>
         <button id="btn-bulk-import" class="sidebar-item" type="button">
           <span class="sidebar-item-left">
@@ -136,18 +136,16 @@
               <polyline points="17 8 12 3 7 8"></polyline>
               <line x1="12" y1="3" x2="12" y2="15"></line>
             </svg>
-            <span>Upload / Bulk Paths</span>
+            <span>Import list of folders</span>
           </span>
-          <span class="nav-ext-arrow" aria-hidden="true">&#8599;</span>
         </button>
         <button id="btn-scan-folder" class="sidebar-item" type="button">
           <span class="sidebar-item-left">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z"></path>
             </svg>
-            <span>Scan Directory</span>
+            <span>Scan a folder</span>
           </span>
-          <span class="nav-ext-arrow" aria-hidden="true">&#8599;</span>
         </button>
       </div>
 
@@ -170,7 +168,7 @@
               <line x1="12" y1="18" x2="12" y2="12"></line>
               <polyline points="9 15 12 18 15 15"></polyline>
             </svg>
-            <span>Export Crash Report</span>
+            <span>Export crash report</span>
           </span>
         </button>
       </div>
@@ -187,14 +185,9 @@
       <header class="topbar">
         <div class="topbar-leading">
           <div class="topbar-intro">
-            <div class="breadcrumb">
-              <span>Dashboard</span>
-              <span class="crumb-sep">&rsaquo;</span>
-              <span class="crumb-current">Local App Studio</span>
-            </div>
             <div class="greeting-row">
               <h1 id="greeting-title">Good evening</h1>
-              <p id="greeting-subtitle">Toggle dev servers on and off, inspect ports, and stream live output logs.</p>
+              <p id="greeting-subtitle">Add a project folder, then start and stop its dev server here and watch its output.</p>
             </div>
           </div>
         </div>
@@ -208,7 +201,7 @@
             <input
               id="project-search"
               type="search"
-              placeholder="Search apps, paths, ports..."
+              placeholder="Search projects, ports, paths…" aria-label="Search projects"
               autocomplete="off"
             />
           </div>
@@ -217,7 +210,7 @@
             <span id="topbar-theme-icon" class="theme-icon-slot" aria-hidden="true"></span>
           </button>
 
-          <button id="btn-reload-app" class="btn btn-soft btn-icon-pill" type="button" title="Fade & reload dashboard" aria-label="Fade and reload dashboard">
+          <button id="btn-reload-app" class="btn btn-soft btn-icon-pill" type="button" title="Reload the dashboard" aria-label="Reload the dashboard">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
               <path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path>
               <path d="M3 3v5h5"></path>
@@ -228,14 +221,14 @@
             <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
               <rect x="6" y="6" width="12" height="12" rx="2"></rect>
             </svg>
-            <span>Stop All</span>
+            <span>Stop all</span>
           </button>
 
           <button id="btn-add-project-top" class="btn btn-primary" type="button">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
               <path d="M12 5v14M5 12h14"></path>
             </svg>
-            <span>Add Project</span>
+            <span>Add project</span>
           </button>
         </div>
       </header>
@@ -244,9 +237,8 @@
       <section id="overview-section" class="overview-section" data-overview-mode="expanded" aria-label="Workspace Summary Metrics">
         <div class="overview-bar">
           <div class="overview-bar-left">
-            <span class="overview-bar-title">Overview &amp; Studio Health</span>
-            <span id="overview-collapsed-summary" class="overview-summary-pill">0 Apps &middot; 0 Live &middot; 0 Stopped</span>
-            <span class="overview-drag-hint">Drag cards or banner to reorder &middot; Drag bottom edge to resize</span>
+            <span class="overview-bar-title">Overview</span>
+            <span id="overview-collapsed-summary" class="overview-summary-pill">0 projects &middot; 0 running &middot; 0 stopped</span>
           </div>
           <div class="overview-bar-actions">
             <button id="btn-overview-position" class="btn btn-xs btn-soft" type="button" title="Move Overview section below or above workspace">Move Below</button>
@@ -261,12 +253,12 @@
         <div id="overview-content" class="overview-content">
           <div class="studio-callout-banner" data-overview-block="banner" draggable="true">
             <div class="callout-copy">
-              <div class="callout-title">Don&apos;t see your local project or framework?</div>
-              <div class="callout-sub">Point Portly at any folder or bulk-scan a workspace directory — 30+ web stacks auto-configured.</div>
+              <div class="callout-title">Add your first project</div>
+              <div class="callout-sub">Point Portly at a project folder, or scan a folder that holds several. It detects 30+ web stacks and their start commands.</div>
             </div>
             <div class="callout-actions">
-              <button id="btn-banner-scan" class="btn btn-sm btn-soft" type="button">Scan Folder</button>
-              <button id="btn-banner-add" class="btn btn-sm btn-primary" type="button">Add Project</button>
+              <button id="btn-banner-scan" class="btn btn-sm btn-soft" type="button">Scan a folder</button>
+              <button id="btn-banner-add" class="btn btn-sm btn-primary" type="button">Add project</button>
             </div>
           </div>
 
@@ -278,24 +270,13 @@
                 <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
               </svg>
             </span>
-            <span class="kpi-label">Registered Apps</span>
+            <span class="kpi-label">Projects</span>
           </div>
           <div class="kpi-body">
             <div class="kpi-metric-group">
               <strong id="stat-total" class="kpi-value">0</strong>
-              <span class="kpi-pill pill-purple">Workspace Ready</span>
+              
             </div>
-            <svg class="kpi-sparkline" viewBox="0 0 96 36" fill="none" aria-hidden="true">
-              <defs>
-                <linearGradient id="sparkPurple" x1="0" y1="0" x2="0" y2="36" gradientUnits="userSpaceOnUse">
-                  <stop stop-color="#A855F7" stop-opacity="0.22" />
-                  <stop offset="1" stop-color="#A855F7" stop-opacity="0" />
-                </linearGradient>
-              </defs>
-              <path d="M2 24 C14 26, 20 14, 34 19 C48 24, 58 8, 74 15 C84 19, 89 9, 94 11 L94 35 L2 35 Z" fill="url(#sparkPurple)" />
-              <path d="M2 24 C14 26, 20 14, 34 19 C48 24, 58 8, 74 15 C84 19, 89 9, 94 11" stroke="#A855F7" stroke-width="2" stroke-linecap="round" />
-              <circle cx="94" cy="11" r="3" fill="var(--bg-card)" stroke="#A855F7" stroke-width="2" />
-            </svg>
           </div>
         </article>
 
@@ -306,24 +287,13 @@
                 <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
               </svg>
             </span>
-            <span class="kpi-label">Active Dev Servers</span>
+            <span class="kpi-label">Running</span>
           </div>
           <div class="kpi-body">
             <div class="kpi-metric-group">
               <strong id="stat-running" class="kpi-value">0</strong>
               <span id="kpi-running-pill" class="kpi-pill pill-slate">Idle</span>
             </div>
-            <svg class="kpi-sparkline" viewBox="0 0 96 36" fill="none" aria-hidden="true">
-              <defs>
-                <linearGradient id="sparkGreen" x1="0" y1="0" x2="0" y2="36" gradientUnits="userSpaceOnUse">
-                  <stop stop-color="#10B981" stop-opacity="0.22" />
-                  <stop offset="1" stop-color="#10B981" stop-opacity="0" />
-                </linearGradient>
-              </defs>
-              <path d="M2 27 C16 25, 22 12, 34 18 C46 24, 56 10, 68 14 C79 18, 84 6, 94 8 L94 35 L2 35 Z" fill="url(#sparkGreen)" />
-              <path d="M2 27 C16 25, 22 12, 34 18 C46 24, 56 10, 68 14 C79 18, 84 6, 94 8" stroke="#10B981" stroke-width="2" stroke-linecap="round" />
-              <circle cx="94" cy="8" r="3" fill="var(--bg-card)" stroke="#10B981" stroke-width="2" />
-            </svg>
           </div>
         </article>
 
@@ -335,24 +305,13 @@
                 <path d="M12 7v5l3 3"></path>
               </svg>
             </span>
-            <span class="kpi-label">Stopped &amp; Health</span>
+            <span class="kpi-label">Stopped</span>
           </div>
           <div class="kpi-body">
             <div class="kpi-metric-group">
               <strong id="stat-stopped" class="kpi-value">0</strong>
               <span id="kpi-crashed-pill" class="kpi-pill pill-slate">Crashed: <strong id="stat-crashed">0</strong></span>
             </div>
-            <svg class="kpi-sparkline" viewBox="0 0 96 36" fill="none" aria-hidden="true">
-              <defs>
-                <linearGradient id="sparkBlue" x1="0" y1="0" x2="0" y2="36" gradientUnits="userSpaceOnUse">
-                  <stop stop-color="#3B82F6" stop-opacity="0.2" />
-                  <stop offset="1" stop-color="#3B82F6" stop-opacity="0" />
-                </linearGradient>
-              </defs>
-              <path d="M2 20 C16 14, 24 25, 38 18 C52 11, 62 23, 76 16 C85 11, 90 15, 94 13 L94 35 L2 35 Z" fill="url(#sparkBlue)" />
-              <path d="M2 20 C16 14, 24 25, 38 18 C52 11, 62 23, 76 16 C85 11, 90 15, 94 13" stroke="#3B82F6" stroke-width="2" stroke-linecap="round" />
-              <circle cx="94" cy="13" r="3" fill="var(--bg-card)" stroke="#3B82F6" stroke-width="2" />
-            </svg>
           </div>
         </article>
           </div>
@@ -375,14 +334,14 @@
       <div class="toolbar">
         <div class="toolbar-left">
           <div class="segmented-control" role="group" aria-label="Layout view">
-            <button class="view-btn active" data-view="split" type="button">
+            <button class="view-btn active" data-view="split" type="button" aria-pressed="true">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <rect width="18" height="18" x="3" y="3" rx="3"></rect>
                 <path d="M12 3v18"></path>
               </svg>
-              <span>Split Console</span>
+              <span>Split</span>
             </button>
-            <button class="view-btn" data-view="cards" type="button">
+            <button class="view-btn" data-view="cards" type="button" aria-pressed="false">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <rect width="7" height="7" x="3" y="3" rx="2"></rect>
                 <rect width="7" height="7" x="14" y="3" rx="2"></rect>
@@ -391,7 +350,7 @@
               </svg>
               <span>Cards</span>
             </button>
-            <button class="view-btn" data-view="table" type="button">
+            <button class="view-btn" data-view="table" type="button" aria-pressed="false">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M3 6h18M3 12h18M3 18h18"></path>
               </svg>
@@ -399,11 +358,11 @@
             </button>
           </div>
 
-          <div class="filter-pills" role="tablist" aria-label="Filter projects">
-            <button class="filter-pill filter-tab active" data-filter="all" type="button">All</button>
-            <button class="filter-pill filter-tab" data-filter="running" type="button">Running</button>
-            <button class="filter-pill filter-tab" data-filter="stopped" type="button">Stopped</button>
-            <button class="filter-pill filter-tab" data-filter="crashed" type="button">Crashed</button>
+          <div class="filter-pills" role="group" aria-label="Filter projects by status">
+            <button class="filter-pill filter-tab active" data-filter="all" type="button" aria-pressed="true">All</button>
+            <button class="filter-pill filter-tab" data-filter="running" type="button" aria-pressed="false">Running</button>
+            <button class="filter-pill filter-tab" data-filter="stopped" type="button" aria-pressed="false">Stopped</button>
+            <button class="filter-pill filter-tab" data-filter="crashed" type="button" aria-pressed="false">Crashed</button>
           </div>
         </div>
 
@@ -417,7 +376,7 @@
         <section class="projects-pane" aria-label="Managed Projects">
           <div class="pane-section-head">
             <div class="pane-section-title-group">
-              <span class="pane-section-title">Popular &amp; Registered Instances</span>
+              <span class="pane-section-title">Projects</span>
               <span id="projects-pane-count" class="nav-count">0</span>
             </div>
           </div>
@@ -447,7 +406,7 @@
                       <line x1="12" y1="19" x2="20" y2="19"></line>
                     </svg>
                   </span>
-                  <h2 id="logs-project-title">Select a project to view logs</h2>
+                  <h2 id="logs-project-title">Logs</h2>
                   <span id="logs-status-pill" class="status-pill hidden">STOPPED</span>
                   <a id="logs-open-app" class="btn btn-xs btn-success hidden" href="#" target="_blank" rel="noopener noreferrer">Open App</a>
                 </div>
@@ -461,16 +420,16 @@
 
             <div class="logs-controls">
               <div class="stream-filters" role="group" aria-label="Filter log stream">
-                <button class="stream-btn active" data-stream="all" type="button">All</button>
-                <button class="stream-btn" data-stream="stdout" type="button">stdout</button>
-                <button class="stream-btn" data-stream="stderr" type="button">stderr</button>
-                <button class="stream-btn" data-stream="system" type="button">system</button>
+                <button class="stream-btn active" data-stream="all" type="button" aria-pressed="true">All</button>
+                <button class="stream-btn" data-stream="stdout" type="button" aria-pressed="false">stdout</button>
+                <button class="stream-btn" data-stream="stderr" type="button" aria-pressed="false">stderr</button>
+                <button class="stream-btn" data-stream="system" type="button" aria-pressed="false">system</button>
               </div>
               <input
                 id="log-search"
                 class="log-search-input"
                 type="search"
-                placeholder="Filter logs..."
+                placeholder="Filter logs…" aria-label="Filter logs"
                 autocomplete="off"
               />
               <label class="autoscroll-toggle">
@@ -478,13 +437,13 @@
                 <span>Auto-scroll</span>
               </label>
               <button id="btn-copy-logs" class="btn btn-xs btn-soft" type="button">Copy</button>
-              <button id="btn-clear-logs" class="btn btn-xs btn-soft" type="button">Clear</button>
-              <button id="btn-export-crash-logs" class="btn btn-xs btn-rose-soft" type="button" title="Save crash report & logs to local machine">Export Crash Log</button>
+              <button id="btn-clear-logs" class="btn btn-xs btn-soft" type="button" title="Delete the saved log file for this project">Clear log file</button>
+              <button id="btn-export-crash-logs" class="btn btn-xs btn-rose-soft" type="button" title="Save a crash report with this project's logs">Crash report</button>
             </div>
           </div>
 
           <div id="logs-output" class="logs-output" tabindex="0">
-            <div class="logs-empty">Click <strong>Logs</strong> on any project to stream live stdout/stderr and view saved logs.</div>
+            <div class="logs-empty">Select a project to see its output.</div>
           </div>
         </aside>
       </main>
@@ -495,7 +454,7 @@
   <div id="project-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-title">
     <div class="modal-card">
       <div class="modal-header">
-        <h3 id="modal-title">Add Local Project</h3>
+        <h3 id="modal-title">Add project</h3>
         <button id="modal-close" class="icon-btn" type="button" aria-label="Close modal">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
             <path d="M18 6 6 18M6 6l12 12"></path>
@@ -504,8 +463,9 @@
       </div>
 
       <div id="modal-tabs" class="modal-tabs">
-        <button class="modal-tab active" data-tab="single" type="button">Single Project</button>
-        <button class="modal-tab" data-tab="bulk" type="button">Upload / Bulk Paths</button>
+        <button class="modal-tab active" data-tab="single" type="button">One project</button>
+        <button class="modal-tab" data-tab="stack" type="button">Stack (several services)</button>
+        <button class="modal-tab" data-tab="bulk" type="button">Import list of folders</button>
       </div>
 
       <!-- Single / Edit Form -->
@@ -553,11 +513,50 @@
           <div class="field-hint">Defaults to <code>npm run dev</code> or the optimal detected stack runner.</div>
         </div>
 
+        <!-- Web address, service type and start order (filled by stacks-ui.js) -->
+        <div id="project-service-fields"></div>
+
+        <details id="project-env-section" class="env-section hidden">
+          <summary>
+            <span>Environment variables</span>
+            <span id="project-env-summary" class="env-summary">None yet</span>
+          </summary>
+          <div id="project-env-editor"></div>
+        </details>
+
         <div id="single-form-error" class="form-error hidden"></div>
 
         <div class="modal-footer">
           <button id="btn-cancel-single" class="btn btn-soft" type="button">Cancel</button>
           <button id="btn-submit-single" class="btn btn-primary" type="submit">Add Project</button>
+        </div>
+      </form>
+
+      <!-- New Stack Form (stacks-ui.js) -->
+      <form id="stack-form" class="modal-body hidden">
+        <p class="stack-intro">A stack starts several services together, in order: for example a database, then an API, then a frontend. Each service keeps its own logs and port.</p>
+        <div class="form-group">
+          <label for="input-stack-path">Main folder</label>
+          <div class="path-input-row">
+            <input id="input-stack-path" type="text" placeholder="C:\Users\you\projects\shop" spellcheck="false" />
+            <button id="btn-stack-browse" class="btn btn-soft" type="button">Browse...</button>
+            <button id="btn-stack-find" class="btn btn-soft" type="button">Find services</button>
+          </div>
+          <div id="stack-suggest-note" class="field-hint" aria-live="polite"></div>
+        </div>
+        <div class="form-group">
+          <label for="input-stack-name">Stack name</label>
+          <input id="input-stack-name" type="text" placeholder="Shop" maxlength="80" />
+        </div>
+        <div class="form-group">
+          <span class="form-label">Services, in start order</span>
+          <div id="stack-services-list" class="stack-services-list"></div>
+          <button id="btn-stack-add-row" class="btn btn-xs btn-ghost" type="button">+ Add a service by hand</button>
+        </div>
+        <div id="stack-form-error" class="form-error hidden"></div>
+        <div class="modal-footer">
+          <button id="btn-cancel-stack" class="btn btn-soft" type="button">Cancel</button>
+          <button id="btn-submit-stack" class="btn btn-primary" type="submit" disabled>Create stack</button>
         </div>
       </form>
 
@@ -621,11 +620,14 @@
           <div class="form-group">
             <label>Theme</label>
             <div class="segmented-control theme-segmented" role="group" aria-label="Choose theme">
-              <button id="settings-theme-light" class="theme-choice-btn active" data-theme-choice="light" type="button">
-                <span>Light (Soft iOS)</span>
+              <button id="settings-theme-system" class="theme-choice-btn" data-theme-choice="system" type="button" aria-pressed="false">
+                <span>System</span>
               </button>
-              <button id="settings-theme-dark" class="theme-choice-btn" data-theme-choice="dark" type="button">
-                <span>Dark (Carbon Grey)</span>
+              <button id="settings-theme-light" class="theme-choice-btn active" data-theme-choice="light" type="button" aria-pressed="true">
+                <span>Light</span>
+              </button>
+              <button id="settings-theme-dark" class="theme-choice-btn" data-theme-choice="dark" type="button" aria-pressed="false">
+                <span>Dark</span>
               </button>
             </div>
           </div>
@@ -652,6 +654,26 @@
             <span>Allow running multiple Portly instances at the same time</span>
           </label>
           <div class="field-hint">When unchecked, opening Portly again restores your existing instance from the system tray or taskbar instead of opening a duplicate window.</div>
+        </div>
+
+        <div class="desktop-app-box">
+          <div class="desktop-app-header">
+            <span class="desktop-app-title">Named URLs</span>
+            <span class="os-pill">*.LOCALHOST</span>
+          </div>
+          <label class="checkbox-row" for="input-named-urls">
+            <input id="input-named-urls" type="checkbox" checked />
+            <span>Give each project a web address like <code>shop.localhost</code>, so you don't need to remember port numbers</span>
+          </label>
+          <div class="form-group named-urls-port-row">
+            <label for="input-proxy-port">Port for named URLs</label>
+            <div class="path-input-row">
+              <input id="input-proxy-port" type="number" min="1" max="65535" value="1355" />
+              <button id="btn-apply-proxy-port" class="btn btn-soft" type="button">Apply</button>
+            </div>
+            <div class="field-hint">Portly listens on this computer only. Port 80 drops the <code>:port</code> from addresses, but macOS and Linux need admin rights for it, and on Windows another web server may already use it.</div>
+          </div>
+          <div id="named-urls-status" class="named-urls-status" aria-live="polite"></div>
         </div>
 
         <div class="desktop-app-box config-io-box">
@@ -710,6 +732,50 @@
     </div>
   </div>
 
+  <!-- Stack Settings Modal (stacks-ui.js) -->
+  <div id="stack-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="stack-modal-title">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="stack-modal-title">Stack settings</h3>
+        <button id="stack-modal-close" class="icon-btn" type="button" aria-label="Close stack settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <path d="M18 6 6 18M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
+      <form id="stack-form-edit" class="modal-body">
+        <div class="form-row-2">
+          <div class="form-group">
+            <label for="input-stack-edit-name">Name</label>
+            <input id="input-stack-edit-name" type="text" maxlength="80" required />
+          </div>
+          <div class="form-group">
+            <label for="input-stack-edit-hostname">Web address</label>
+            <div class="hostname-input">
+              <input id="input-stack-edit-hostname" type="text" spellcheck="false" autocomplete="off" />
+              <span id="stack-edit-hostname-suffix" class="hostname-suffix">.localhost:1355</span>
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label for="input-stack-primary">This address opens</label>
+          <select id="input-stack-primary"></select>
+          <div class="field-hint">Each service also has its own address, such as <code>api.shop.localhost</code>.</div>
+        </div>
+        <div class="form-group">
+          <span class="form-label">Variables for every service in this stack</span>
+          <div id="stack-env-editor"></div>
+          <div class="field-hint">A service's own variables win over these. Portly also adds <code>PORTLY_&lt;SERVICE&gt;_URL</code> and <code>PORTLY_&lt;SERVICE&gt;_PORT</code> for every service that is already running.</div>
+        </div>
+        <div id="stack-modal-error" class="form-error hidden"></div>
+        <div class="modal-footer">
+          <button id="btn-cancel-stack-edit" class="btn btn-soft" type="button">Cancel</button>
+          <button class="btn btn-primary" type="submit">Save</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Broken Directory Path Repair Modal -->
   <div id="broken-paths-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="broken-paths-modal-title">
     <div class="modal-card modal-card-wide">
@@ -748,7 +814,7 @@
         <div class="brand-badge onboarding-logo" aria-hidden="true">
           <img src="/portly-logo-white.png" alt="Portly logo" class="brand-logo-img" />
         </div>
-        <span class="onboarding-badge">Multi-OS &middot; Universal Stack Studio</span>
+        <span class="onboarding-badge">Windows &middot; macOS &middot; Linux</span>
       </div>
 
       <h2 id="onboarding-title" class="onboarding-title">Welcome to Portly</h2>
@@ -782,24 +848,24 @@
         </div>
 
         <div class="form-group">
-          <label>Choose Appearance</label>
+          <label>Appearance</label>
           <div class="segmented-control theme-segmented" role="group" aria-label="Choose initial theme">
             <button id="onboarding-theme-light" class="onboarding-theme-btn active" data-onboarding-theme="light" type="button">
-              <span>Light (Soft iOS)</span>
+              <span>Light</span>
             </button>
             <button id="onboarding-theme-dark" class="onboarding-theme-btn" data-onboarding-theme="dark" type="button">
-              <span>Dark (Carbon Grey)</span>
+              <span>Dark</span>
             </button>
           </div>
         </div>
 
         <label class="checkbox-row">
           <input id="onboarding-default-expanded" type="checkbox" />
-          <span>Expand all project cards by default (leave unchecked for compact cards)</span>
+          <span>Show project details expanded</span>
         </label>
 
         <button id="btn-complete-onboarding" class="btn btn-primary onboarding-submit-btn" type="submit">
-          <span>Launch My Studio &rarr;</span>
+          <span>Get started &rarr;</span>
         </button>
 
         <div class="onboarding-config-row">
@@ -813,9 +879,10 @@
   </div>
 
   <!-- Toast Notification -->
-  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <div id="toast-container" class="toast-container"></div>
   <input id="config-file-input" type="file" accept=".json,application/json" class="hidden" />
 
+  <script src="/stacks-ui.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

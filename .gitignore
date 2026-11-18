@@ -18,3 +18,7 @@ data/
 Portly.lnk
 # Unused large source images (the app uses the .png/.ico versions)
 public/*.jpg
+
+# Backups made by the Nov 2026 audit-fix pass (safe to delete once the changes are committed)
+.audit-backup-*/
+.stacks-backup-*/

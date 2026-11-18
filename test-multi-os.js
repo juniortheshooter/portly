@@ -582,6 +582,15 @@ async function run() {
           },
           mode: 'replace'
         };
+        // Imported configs are untrusted: new or changed start commands need explicit confirmation.
+        const unconfirmedRes = await requestJson(started.url, '/api/config/import', 'POST', importPayload);
+        assert.strictEqual(unconfirmedRes.status, 409);
+        assert.strictEqual(unconfirmedRes.data.needsConfirmation, true);
+        assert.ok(
+          unconfirmedRes.data.commandChanges.some((c) => c.to === 'node server.js'),
+          'Expected the review list to include the imported command'
+        );
+        importPayload.confirmCommands = true;
         const importRes = await requestJson(started.url, '/api/config/import', 'POST', importPayload);
         assert.strictEqual(importRes.status, 200);
         assert.strictEqual(importRes.data.ok, true);
@@ -613,7 +622,7 @@ async function run() {
       } finally {
         srv.setCustomConfigSaver(null);
         if (baselineConfig) {
-          await requestJson(started.url, '/api/config/import', 'POST', { config: baselineConfig, mode: 'replace' });
+          await requestJson(started.url, '/api/config/import', 'POST', { config: baselineConfig, mode: 'replace', confirmCommands: true });
         }
         await requestJson(started.url, '/api/settings/reset', 'POST', {});
         for (const f of configCleanupFiles) {

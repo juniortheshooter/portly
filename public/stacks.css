@@ -1,0 +1,484 @@
+/* Stacks, environment variables and named URLs (stacks-ui.js). Uses the theme tokens in styles.css. */
+
+/* ---------- stack card ---------- */
+.stack-card .stack-avatar {
+  display: grid;
+  place-items: center;
+  color: var(--purple-text);
+  background: var(--purple-soft);
+  border: 1px solid var(--purple-border);
+}
+
+.stack-card .stack-avatar.running {
+  color: var(--green-text);
+  background: var(--green-soft);
+  border-color: var(--green-border);
+}
+
+.stack-card .stack-avatar.crashed {
+  color: var(--rose-text);
+  background: var(--rose-soft);
+  border-color: var(--rose-border);
+}
+
+.stack-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-pill-neutral);
+  padding: 2px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+.stack-services {
+  list-style: none;
+  margin: 12px 0 2px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.stack-service {
+  display: grid;
+  grid-template-columns: 10px minmax(90px, 1.1fr) minmax(0, 1.6fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 12px;
+  background: var(--bg-card-elevated);
+  min-height: 38px;
+}
+
+.stack-service + .stack-service {
+  border-top: 1px solid var(--border-soft);
+}
+
+.stack-service.selected {
+  background: var(--bg-selected-row);
+}
+
+.stack-service-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+
+.stack-service-name > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stack-service-name:hover > span:first-child {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.service-kind {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 0 5px;
+}
+
+.stack-service-meta {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.service-meta {
+  color: var(--text-muted);
+}
+
+.service-meta.starting {
+  color: var(--amber);
+  font-family: var(--font-sans);
+}
+
+.service-meta.crashed {
+  color: var(--rose-text);
+  font-family: var(--font-sans);
+}
+
+.service-link {
+  color: var(--green-text);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.service-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.stack-service-after {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stack-service-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ios-switch.ios-switch-sm {
+  width: 32px;
+  height: 18px;
+}
+
+.ios-switch.ios-switch-sm::after {
+  width: 14px;
+  height: 14px;
+}
+
+.ios-switch.ios-switch-sm.on::after {
+  transform: translateX(14px);
+}
+
+.stack-card .card-footer-row {
+  margin-top: 10px;
+}
+
+.stack-chip-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--purple-text);
+  vertical-align: middle;
+}
+
+.stack-chip-inline svg {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 1100px) {
+  .stack-service {
+    grid-template-columns: 10px minmax(80px, 1fr) minmax(0, 1.4fr) auto;
+  }
+  .stack-service-after {
+    display: none;
+  }
+}
+
+/* ---------- web address field ---------- */
+.hostname-input {
+  display: flex;
+  align-items: stretch;
+}
+
+.hostname-input input {
+  flex: 1;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+  font-family: var(--font-mono);
+}
+
+.hostname-suffix {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-soft);
+  border-left: none;
+  border-radius: 0 10px 10px 0;
+  white-space: nowrap;
+}
+
+.start-after-group {
+  border: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+
+.start-after-group legend,
+.form-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 0;
+  margin-bottom: 6px;
+}
+
+.start-after-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+}
+
+/* ---------- environment variables ---------- */
+.env-section {
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.env-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  list-style: none;
+}
+
+.env-section > summary::-webkit-details-marker {
+  display: none;
+}
+
+.env-section > summary::after {
+  content: "▸";
+  color: var(--text-muted);
+  margin-left: 4px;
+  transition: transform 0.15s;
+}
+
+.env-section[open] > summary::after {
+  transform: rotate(90deg);
+}
+
+.env-summary {
+  margin-left: auto;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.env-section > #project-env-editor {
+  padding: 0 12px 12px;
+}
+
+.env-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.env-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.env-profile-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.env-profile-select {
+  width: auto;
+  min-width: 140px;
+}
+
+.env-toolbar-spacer {
+  flex: 1;
+}
+
+.env-new-profile {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.env-new-profile-input {
+  width: 120px;
+}
+
+.env-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.env-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr) auto auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.env-row input {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.env-empty {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  padding: 10px 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 10px;
+}
+
+.env-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ---------- new stack form ---------- */
+.stack-intro {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.stack-services-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stack-svc-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--bg-card-elevated);
+}
+
+.stack-svc-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.stack-svc-head input {
+  flex: 1;
+  font-weight: 600;
+}
+
+.stack-svc-head select {
+  width: auto;
+}
+
+.stack-svc-step {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--bg-pill-neutral);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.stack-svc-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.stack-svc-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.stack-svc-grid input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.stack-svc-after {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.stack-svc-after .checkbox-row {
+  font-size: 12.5px;
+}
+
+/* ---------- settings ---------- */
+.named-urls-port-row {
+  margin-top: 8px;
+}
+
+.named-urls-port-row input {
+  max-width: 120px;
+}
+
+.named-urls-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 6px;
+}
+
+.named-urls-status.ok {
+  color: var(--green-text);
+}
+
+.named-urls-status.error {
+  color: var(--rose-text);
+}
+
+@media (max-width: 720px) {
+  .stack-svc-grid,
+  .env-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* styles.css styles text/number inputs only; value fields here are password inputs. */
+input[type="password"] {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  color: var(--text-primary);
+  padding: 9px 12px;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+
+.env-row input {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}

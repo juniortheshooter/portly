@@ -179,7 +179,7 @@ const TOOLS = [
   {
     name: 'portly_add_project',
     description:
-      'Register a project folder in Portly so it can be started and stopped. Portly auto-detects the stack and start command; pass command only to override it. Does not start the project.',
+      'Register a project folder in Portly so it can be started and stopped. Portly auto-detects the stack and start command; pass command only to override it. A custom command is run as a shell command (as the user) when the project starts, so only pass one the user has asked for or approved. Does not start the project.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -194,11 +194,60 @@ const TOOLS = [
     annotations: {
       title: 'Add a project',
       readOnlyHint: false,
-      destructiveHint: false,
+      // A custom command becomes a shell command that runs on Start, so clients should ask first.
+      destructiveHint: true,
       idempotentHint: false,
       openWorldHint: false
     },
     run: async (args) => client.summarize(await client.addProject(args))
+  },
+  {
+    name: 'portly_list_stacks',
+    description:
+      'List Portly stacks: groups of services (for example a database, an API and a frontend) that start together in order. Shows each stack\'s status, address and services.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { title: 'List stacks', readOnlyHint: true, openWorldHint: false },
+    run: async () => {
+      const stacks = await client.listStacks();
+      return { count: stacks.length, stacks: await Promise.all(stacks.map(client.describeStack)) };
+    }
+  },
+  {
+    name: 'portly_start_stack',
+    description:
+      'Start every service of a stack in its saved order. Each service waits until the ones it depends on answer on their port. Returns each service\'s URL, or the problems if one failed.',
+    inputSchema: {
+      type: 'object',
+      properties: { stack: { type: 'string', description: 'Stack name or id. A unique partial name also works.' } },
+      required: ['stack'],
+      additionalProperties: false
+    },
+    annotations: {
+      title: 'Start a stack',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    run: async ({ stack }) => client.startStack(stack)
+  },
+  {
+    name: 'portly_stop_stack',
+    description: 'Stop every service of a stack (frontends and workers first, databases last).',
+    inputSchema: {
+      type: 'object',
+      properties: { stack: { type: 'string', description: 'Stack name or id.' } },
+      required: ['stack'],
+      additionalProperties: false
+    },
+    annotations: {
+      title: 'Stop a stack',
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    run: async ({ stack }) => client.stopStack(stack)
   },
   {
     name: 'portly_stop_all',
@@ -207,7 +256,7 @@ const TOOLS = [
     annotations: {
       title: 'Stop all projects',
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: true,
       openWorldHint: false
     },
